@@ -1,0 +1,159 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-research}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-research}
+      POSTGRES_DB: ${POSTGRES_DB:-stock_research}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-research} -d ${POSTGRES_DB:-stock_research}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  llama:
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    profiles: ["gpu"]
+    gpus: all
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    command:
+      - -m
+      - /models/${LLAMA_MODEL:-Qwen3.6-35B-A3B-UD-IQ4_NL_XL.gguf}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - -c
+      - ${LLAMA_CONTEXT_SIZE:-16384}
+      - --n-gpu-layers
+      - ${LLAMA_N_GPU_LAYERS:-99}
+      - --parallel
+      - ${LLAMA_PARALLEL:-1}
+      - --cont-batching
+    ports:
+      - "${LLAMA_PORT:-8080}:8080"
+    volumes:
+      - ./models:/models:ro
+
+  research:
+    build:
+      context: ./services/research
+      network: host
+    environment:
+      LLAMA_BASE_URL: ${LLAMA_BASE_URL:-http://llama:8080/v1}
+      LLAMA_BASE_URLS: ${LLAMA_BASE_URLS:-http://llama:8080/v1,http://host.docker.internal:8080/v1}
+      LLAMA_MODEL_NAME: ${LLAMA_MODEL_NAME:-local-gguf}
+      LLAMA_REQUEST_TIMEOUT: ${LLAMA_REQUEST_TIMEOUT:-900}
+      LLM_THINKING_MODE: ${LLM_THINKING_MODE:-auto}
+      LLM_AUTO_THINKING_FOR_JSON: ${LLM_AUTO_THINKING_FOR_JSON:-false}
+      LLM_RAW_LOG_ENABLED: ${LLM_RAW_LOG_ENABLED:-true}
+      LLM_RAW_LOG_MAX_CHARS: ${LLM_RAW_LOG_MAX_CHARS:-24000}
+      ALLOW_LLM_FALLBACK: ${ALLOW_LLM_FALLBACK:-false}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${RESEARCH_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./apps/api
+      network: host
+    environment:
+      NODE_ENV: development
+      NODE_OPTIONS: ${NODE_OPTIONS:---dns-result-order=ipv4first}
+      PORT: 4000
+      DATABASE_URL: ${DATABASE_URL:-postgres://research:research@postgres:5432/stock_research}
+      RESEARCH_API_URL: http://research:8000
+      RESEARCH_TIMEOUT_MS: ${RESEARCH_TIMEOUT_MS:-900000}
+      HYPOTHESIS_LOOP_SAFETY_MAX_TURNS: ${HYPOTHESIS_LOOP_SAFETY_MAX_TURNS:-12}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      S3_ENDPOINT: ${S3_ENDPOINT:-http://minio:9000}
+      S3_BUCKET: ${S3_BUCKET:-research-artifacts}
+      JQUANTS_BASE_URL: ${JQUANTS_BASE_URL:-https://api.jquants.com/v2}
+      JQUANTS_API_KEY: ${JQUANTS_API_KEY:-}
+      JQUANTS_API_TOKEN: ${JQUANTS_API_TOKEN:-}
+      JQUANTS_ID_TOKEN: ${JQUANTS_ID_TOKEN:-}
+      JQUANTS_REFRESH_TOKEN: ${JQUANTS_REFRESH_TOKEN:-}
+      JQUANTS_EMAIL: ${JQUANTS_EMAIL:-}
+      JQUANTS_PASSWORD: ${JQUANTS_PASSWORD:-}
+      MACRO_INDEX_SYMBOLS: ${MACRO_INDEX_SYMBOLS:-}
+      OFFICIAL_NEWS_RSS_URLS: ${OFFICIAL_NEWS_RSS_URLS:-}
+      TRUSTED_NEWS_RSS_URLS: ${TRUSTED_NEWS_RSS_URLS:-}
+      MACRO_NEWS_RSS_URLS: ${MACRO_NEWS_RSS_URLS:-}
+      NEWS_LOOKBACK_DAYS: ${NEWS_LOOKBACK_DAYS:-450}
+      NEWS_MAX_RECORDS: ${NEWS_MAX_RECORDS:-320}
+      COMPANY_NEWS_MAX_RECORDS: ${COMPANY_NEWS_MAX_RECORDS:-260}
+      MACRO_NEWS_MAX_RECORDS: ${MACRO_NEWS_MAX_RECORDS:-360}
+      NEWS_GDELT_MIN_INTERVAL_MS: ${NEWS_GDELT_MIN_INTERVAL_MS:-7000}
+      MACRO_NEWS_QUERY: ${MACRO_NEWS_QUERY:-}
+      PURGE_SAMPLE_DATA_ON_START: ${PURGE_SAMPLE_DATA_ON_START:-true}
+    ports:
+      - "${API_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      research:
+        condition: service_started
+
+  web:
+    build:
+      context: ./apps/web
+      network: host
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:${API_PORT:-4000}
+      API_INTERNAL_URL: http://api:4000
+      PORT: 3000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "node -e \"fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+volumes:
+  postgres_data:
+  minio_data:

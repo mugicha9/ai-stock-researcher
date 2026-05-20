@@ -1,0 +1,17 @@
+.env
+.env.local
+.DS_Store
+node_modules/
+.next/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+*.log
+models/*.gguf
+models/**/*.gguf
+storage/
+tmp/
+
