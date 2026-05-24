@@ -78,8 +78,12 @@ def summarize_input(agent_name: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 def thinking_system_instruction(enabled: bool) -> str:
     if enabled:
-        return " 必要なら内部で深く検討してよいですが、最終出力は必ずJSONオブジェクトだけにしてください。"
-    return " /no_think 最終出力はJSONオブジェクトの開始波括弧から始め、内部推論、説明文、Markdownを出さないでください。"
+        return " 必要なら内部で深く検討してよいですが、最終出力は必ず単一のJSONオブジェクトだけにしてください。"
+    return (
+        " /no_think "
+        "最終出力は単一のJSONオブジェクトのみです。最初の非空白文字は {、最後の非空白文字は } にしてください。"
+        "内部推論、説明文、Markdown、コードフェンス、<think>、JSON前後の文章を絶対に出さないでください。"
+    )
 
 
 def resolve_thinking_enabled(payload: dict[str, Any]) -> tuple[bool, str]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -26,6 +27,11 @@ class LlamaClient:
         self.model = os.getenv("LLAMA_MODEL_NAME", "local-gguf")
         self.allow_fallback = os.getenv("ALLOW_LLM_FALLBACK", "false").lower() == "true"
         self.timeout = float(os.getenv("LLAMA_REQUEST_TIMEOUT", "300"))
+        self.connect_timeout = float(os.getenv("LLAMA_CONNECT_TIMEOUT", "20"))
+        self.request_retries = max(0, self._int_env("LLM_REQUEST_RETRIES", 2))
+        self.retry_backoff_seconds = max(0.0, float(os.getenv("LLM_RETRY_BACKOFF_SECONDS", "2")))
+        self.json_repair_retries = max(0, self._int_env("LLM_JSON_REPAIR_RETRIES", 1))
+        self.response_format_json = os.getenv("LLM_RESPONSE_FORMAT_JSON", "true").lower() not in {"0", "false", "no", "off"}
         self.raw_log_enabled = os.getenv("LLM_RAW_LOG_ENABLED", "true").lower() != "false"
         self.raw_log_max_chars = self._int_env("LLM_RAW_LOG_MAX_CHARS", 24000)
 
@@ -72,8 +78,64 @@ class LlamaClient:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "timeout_seconds": self.timeout,
+            "connect_timeout_seconds": self.connect_timeout,
+            "response_format": "json_object" if self.response_format_json else None,
             "chat_template_kwargs": {"enable_thinking": thinking_enabled},
         }
+
+    def _http_timeout(self) -> httpx.Timeout:
+        return httpx.Timeout(self.timeout, connect=self.connect_timeout)
+
+    def _json_contract(self, thinking_enabled: bool) -> str:
+        no_think = "\n/no_think" if not thinking_enabled else ""
+        return (
+            f"{no_think}\n"
+            "JSON STRICT MODE:\n"
+            "- Return exactly one valid JSON object and nothing else.\n"
+            "- The first non-whitespace character must be { and the last non-whitespace character must be }.\n"
+            "- Do not output Markdown fences, prose, XML tags, <think> blocks, comments, or trailing text.\n"
+            "- Use double quotes for every JSON key and string value.\n"
+            "- Do not use undefined, NaN, Infinity, comments, or trailing commas.\n"
+            "- If uncertain, put the uncertainty in JSON fields such as missing_information or reason_for_next_action.\n"
+        )
+
+    def _enforce_json_system(self, system: str, thinking_enabled: bool) -> str:
+        return f"{system.rstrip()}\n\n{self._json_contract(thinking_enabled)}"
+
+    def _enforce_json_user(self, user: str) -> str:
+        return (
+            f"{user.rstrip()}\n\n"
+            "FINAL OUTPUT CHECK: output only the JSON object. Start with { immediately. End with }."
+        )
+
+    def _chat_payload(
+        self,
+        *,
+        system: str,
+        user: str,
+        temperature: float,
+        max_tokens: int,
+        thinking_enabled: bool,
+        force_response_format: bool = True,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": thinking_enabled},
+        }
+        if self.response_format_json and force_response_format:
+            payload["response_format"] = {"type": "json_object"}
+        return payload
+
+    async def _retry_pause(self, retry_index: int) -> None:
+        if retry_index <= 0 or self.retry_backoff_seconds <= 0:
+            return
+        await asyncio.sleep(self.retry_backoff_seconds * retry_index)
 
     def _raw_interaction(
         self,
@@ -115,6 +177,10 @@ class LlamaClient:
                             "fallback_enabled": self.allow_fallback,
                             "thinking_mode": os.getenv("LLM_THINKING_MODE", "auto"),
                             "auto_thinking_for_json": os.getenv("LLM_AUTO_THINKING_FOR_JSON", "false"),
+                            "response_format_json": self.response_format_json,
+                            "request_retries": self.request_retries,
+                            "json_repair_retries": self.json_repair_retries,
+                            "connect_timeout_seconds": self.connect_timeout,
                             "attempts": attempts,
                         }
                 except Exception as exc:
@@ -128,6 +194,10 @@ class LlamaClient:
             "fallback_enabled": self.allow_fallback,
             "thinking_mode": os.getenv("LLM_THINKING_MODE", "auto"),
             "auto_thinking_for_json": os.getenv("LLM_AUTO_THINKING_FOR_JSON", "false"),
+            "response_format_json": self.response_format_json,
+            "request_retries": self.request_retries,
+            "json_repair_retries": self.json_repair_retries,
+            "connect_timeout_seconds": self.connect_timeout,
             "attempts": attempts,
         }
 
@@ -144,9 +214,12 @@ class LlamaClient:
         thinking_enabled: bool = False,
     ) -> dict[str, Any]:
         started_at = time.perf_counter()
+        system = self._enforce_json_system(system, thinking_enabled)
+        user = self._enforce_json_user(user)
         attempts: list[dict[str, Any]] = []
         last_error_response: dict[str, Any] | None = None
         last_raw_request: dict[str, Any] | None = None
+        attempt_number = 0
         log_event(
             "llm_request_started",
             request_id=request_id,
@@ -158,164 +231,256 @@ class LlamaClient:
             max_tokens=max_tokens,
             temperature=temperature,
             timeout_seconds=self.timeout,
+            connect_timeout_seconds=self.connect_timeout,
+            request_retries=self.request_retries,
+            json_repair_retries=self.json_repair_retries,
+            response_format_json=self.response_format_json,
             thinking_enabled=thinking_enabled,
         )
-        for attempt_index, base_url in enumerate(self.base_urls, start=1):
-            attempt_started_at = time.perf_counter()
-            raw_request = self._raw_request(
-                base_url=base_url,
-                system=system,
-                user=user,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                operation=operation,
-                thinking_enabled=thinking_enabled,
-            )
-            last_raw_request = raw_request
-            log_event(
-                "llm_request_attempt_started",
-                request_id=request_id,
-                operation=operation,
-                attempt=attempt_index,
-                base_url=base_url,
-            )
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                try:
-                    response = await client.post(
-                        f"{base_url}/chat/completions",
-                        json={
-                            "model": self.model,
-                            "messages": [
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": user},
-                            ],
-                            "temperature": temperature,
-                            "max_tokens": max_tokens,
-                            "chat_template_kwargs": {"enable_thinking": thinking_enabled},
-                        },
-                    )
-                    duration_ms = round((time.perf_counter() - attempt_started_at) * 1000)
-                    if not response.is_success:
-                        last_error_response = {"status_code": response.status_code, "body": response.text[:4000]}
+        for base_url in self.base_urls:
+            for retry_index in range(self.request_retries + 1):
+                await self._retry_pause(retry_index)
+                attempt_number += 1
+                attempt_started_at = time.perf_counter()
+                raw_request = self._raw_request(
+                    base_url=base_url,
+                    system=system,
+                    user=user,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    operation=operation,
+                    thinking_enabled=thinking_enabled,
+                )
+                last_raw_request = raw_request
+                log_event(
+                    "llm_request_attempt_started",
+                    request_id=request_id,
+                    operation=operation,
+                    attempt=attempt_number,
+                    retry=retry_index,
+                    base_url=base_url,
+                )
+                async with httpx.AsyncClient(timeout=self._http_timeout()) as client:
+                    try:
+                        response = await client.post(
+                            f"{base_url}/chat/completions",
+                            json=self._chat_payload(
+                                system=system,
+                                user=user,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                thinking_enabled=thinking_enabled,
+                            ),
+                        )
+                        duration_ms = round((time.perf_counter() - attempt_started_at) * 1000)
+                        if not response.is_success:
+                            last_error_response = {"status_code": response.status_code, "body": response.text[:4000]}
+                            attempts.append(
+                                {
+                                    "attempt": attempt_number,
+                                    "retry": retry_index,
+                                    "base_url": base_url,
+                                    "status_code": response.status_code,
+                                    "duration_ms": duration_ms,
+                                    "error": response.text[:1000],
+                                }
+                            )
+                            log_event(
+                                "llm_request_failed_status",
+                                request_id=request_id,
+                                operation=operation,
+                                attempt=attempt_number,
+                                retry=retry_index,
+                                base_url=base_url,
+                                status_code=response.status_code,
+                                duration_ms=duration_ms,
+                                response_text=response.text[:1000],
+                            )
+                            continue
+
+                        try:
+                            data = response.json()
+                        except Exception as decode_exc:
+                            last_error_response = {"status_code": response.status_code, "body": response.text[:4000]}
+                            attempts.append(
+                                {
+                                    "attempt": attempt_number,
+                                    "retry": retry_index,
+                                    "base_url": base_url,
+                                    "status_code": response.status_code,
+                                    "duration_ms": duration_ms,
+                                    "exception_type": type(decode_exc).__name__,
+                                    "error": f"HTTP response was not JSON: {decode_exc}",
+                                    "body_excerpt": response.text[:1000],
+                                }
+                            )
+                            log_event(
+                                "llm_http_json_decode_failed",
+                                request_id=request_id,
+                                operation=operation,
+                                attempt=attempt_number,
+                                retry=retry_index,
+                                base_url=base_url,
+                                duration_ms=duration_ms,
+                                error=str(decode_exc),
+                                body_excerpt=response.text[:1000],
+                            )
+                            continue
+
+                        try:
+                            content = data["choices"][0]["message"]["content"]
+                        except Exception as content_exc:
+                            attempts.append(
+                                {
+                                    "attempt": attempt_number,
+                                    "retry": retry_index,
+                                    "base_url": base_url,
+                                    "status_code": response.status_code,
+                                    "duration_ms": duration_ms,
+                                    "exception_type": type(content_exc).__name__,
+                                    "error": f"OpenAI-compatible response missing choices[0].message.content: {content_exc}",
+                                    "body_excerpt": self._clip(data, 2000),
+                                }
+                            )
+                            log_event(
+                                "llm_response_content_missing",
+                                request_id=request_id,
+                                operation=operation,
+                                attempt=attempt_number,
+                                retry=retry_index,
+                                base_url=base_url,
+                                duration_ms=duration_ms,
+                                error=str(content_exc),
+                            )
+                            continue
+
+                        log_event(
+                            "llm_response_received",
+                            request_id=request_id,
+                            operation=operation,
+                            status_code=response.status_code,
+                            attempt=attempt_number,
+                            retry=retry_index,
+                            base_url=base_url,
+                            duration_ms=duration_ms,
+                            response_chars=len(content),
+                        )
+                        try:
+                            parsed = self._parse_json(content)
+                            raw_interaction = self._raw_interaction(
+                                request_payload=raw_request,
+                                status_code=response.status_code,
+                                duration_ms=duration_ms,
+                                response_content=content,
+                                response_body={
+                                    "usage": data.get("usage"),
+                                    "model": data.get("model"),
+                                    "attempts": [
+                                        *attempts,
+                                        {
+                                            "attempt": attempt_number,
+                                            "retry": retry_index,
+                                            "base_url": base_url,
+                                            "status_code": response.status_code,
+                                            "duration_ms": duration_ms,
+                                            "ok": True,
+                                        },
+                                    ],
+                                },
+                            )
+                            if raw_interaction:
+                                parsed["llm_raw"] = raw_interaction
+                            log_event(
+                                "llm_json_parsed",
+                                request_id=request_id,
+                                operation=operation,
+                                duration_ms=round((time.perf_counter() - started_at) * 1000),
+                                output_keys=list(parsed.keys())[:20],
+                            )
+                            return parsed
+                        except Exception as parse_exc:
+                            attempts.append(
+                                {
+                                    "attempt": attempt_number,
+                                    "retry": retry_index,
+                                    "base_url": base_url,
+                                    "status_code": response.status_code,
+                                    "duration_ms": duration_ms,
+                                    "error": f"json_parse_failed: {parse_exc}",
+                                    "response_chars": len(content),
+                                }
+                            )
+                            logger.warning(
+                                "llm_json_parse_failed %s",
+                                json.dumps(
+                                    {
+                                        "request_id": request_id,
+                                        "operation": operation,
+                                        "duration_ms": round((time.perf_counter() - started_at) * 1000),
+                                        "reason": str(parse_exc),
+                                        "response_chars": len(content),
+                                    },
+                                    ensure_ascii=False,
+                                    default=str,
+                                ),
+                            )
+                            repaired = await self._repair_json_output(
+                                base_url=base_url,
+                                invalid_content=content,
+                                fallback=fallback,
+                                original_operation=operation,
+                                request_id=request_id,
+                                attempts=attempts,
+                                max_tokens=max_tokens,
+                                raw_request=raw_request,
+                                original_status_code=response.status_code,
+                                original_duration_ms=duration_ms,
+                                original_data=data,
+                            )
+                            if repaired is not None:
+                                return repaired
+                            return self._fallback_with_raw_output(
+                                fallback,
+                                content,
+                                str(parse_exc),
+                                self._raw_interaction(
+                                    request_payload=raw_request,
+                                    status_code=response.status_code,
+                                    duration_ms=round((time.perf_counter() - started_at) * 1000),
+                                    response_content=content,
+                                    response_body={"usage": data.get("usage"), "model": data.get("model"), "attempts": attempts},
+                                ),
+                            )
+                    except Exception as exc:
+                        duration_ms = round((time.perf_counter() - attempt_started_at) * 1000)
                         attempts.append(
                             {
-                                "attempt": attempt_index,
+                                "attempt": attempt_number,
+                                "retry": retry_index,
                                 "base_url": base_url,
-                                "status_code": response.status_code,
                                 "duration_ms": duration_ms,
-                                "error": response.text[:1000],
+                                "exception_type": type(exc).__name__,
+                                "error": str(exc),
                             }
                         )
-                        log_event(
-                            "llm_request_failed_status",
-                            request_id=request_id,
-                            operation=operation,
-                            attempt=attempt_index,
-                            base_url=base_url,
-                            status_code=response.status_code,
-                            duration_ms=duration_ms,
-                            response_text=response.text[:1000],
-                        )
-                        continue
-                    data = response.json()
-                    content = data["choices"][0]["message"]["content"]
-                    log_event(
-                        "llm_response_received",
-                        request_id=request_id,
-                        operation=operation,
-                        status_code=response.status_code,
-                        attempt=attempt_index,
-                        base_url=base_url,
-                        duration_ms=duration_ms,
-                        response_chars=len(content),
-                    )
-                    try:
-                        parsed = self._parse_json(content)
-                        raw_interaction = self._raw_interaction(
-                            request_payload=raw_request,
-                            status_code=response.status_code,
-                            duration_ms=duration_ms,
-                            response_content=content,
-                            response_body={
-                                "usage": data.get("usage"),
-                                "model": data.get("model"),
-                                "attempts": [
-                                    *attempts,
-                                    {
-                                        "attempt": attempt_index,
-                                        "base_url": base_url,
-                                        "status_code": response.status_code,
-                                        "duration_ms": duration_ms,
-                                        "ok": True,
-                                    },
-                                ],
-                            },
-                        )
-                        if raw_interaction:
-                            parsed["llm_raw"] = raw_interaction
-                        log_event(
-                            "llm_json_parsed",
-                            request_id=request_id,
-                            operation=operation,
-                            duration_ms=round((time.perf_counter() - started_at) * 1000),
-                            output_keys=list(parsed.keys())[:20],
-                        )
-                        return parsed
-                    except Exception as parse_exc:
                         logger.warning(
-                            "llm_json_parse_failed %s",
+                            "llm_request_attempt_exception %s",
                             json.dumps(
                                 {
                                     "request_id": request_id,
                                     "operation": operation,
-                                    "duration_ms": round((time.perf_counter() - started_at) * 1000),
-                                    "reason": str(parse_exc),
-                                    "response_chars": len(content),
+                                    "attempt": attempt_number,
+                                    "retry": retry_index,
+                                    "duration_ms": duration_ms,
+                                    "base_url": base_url,
+                                    "model": self.model,
+                                    "error": str(exc),
+                                    "exception_type": type(exc).__name__,
                                 },
                                 ensure_ascii=False,
                                 default=str,
                             ),
                         )
-                        return self._fallback_with_raw_output(
-                            fallback,
-                            content,
-                            str(parse_exc),
-                            self._raw_interaction(
-                                request_payload=raw_request,
-                                status_code=response.status_code,
-                                duration_ms=round((time.perf_counter() - started_at) * 1000),
-                                response_content=content,
-                                response_body={"usage": data.get("usage"), "model": data.get("model"), "attempts": attempts},
-                            ),
-                        )
-                except Exception as exc:
-                    duration_ms = round((time.perf_counter() - attempt_started_at) * 1000)
-                    attempts.append(
-                        {
-                            "attempt": attempt_index,
-                            "base_url": base_url,
-                            "duration_ms": duration_ms,
-                            "exception_type": type(exc).__name__,
-                            "error": str(exc),
-                        }
-                    )
-                    logger.warning(
-                        "llm_request_attempt_exception %s",
-                        json.dumps(
-                            {
-                                "request_id": request_id,
-                                "operation": operation,
-                                "attempt": attempt_index,
-                                "duration_ms": duration_ms,
-                                "base_url": base_url,
-                                "model": self.model,
-                                "error": str(exc),
-                                "exception_type": type(exc).__name__,
-                            },
-                            ensure_ascii=False,
-                            default=str,
-                        ),
-                    )
 
         duration_ms = round((time.perf_counter() - started_at) * 1000)
         error_message = attempts[-1].get("error") if attempts else "no llama request attempted"
@@ -366,6 +531,188 @@ class LlamaClient:
                 ),
             },
         )
+
+    async def _repair_json_output(
+        self,
+        *,
+        base_url: str,
+        invalid_content: str,
+        fallback: dict[str, Any],
+        original_operation: str,
+        request_id: str | None,
+        attempts: list[dict[str, Any]],
+        max_tokens: int,
+        raw_request: dict[str, Any] | None,
+        original_status_code: int,
+        original_duration_ms: int,
+        original_data: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if self.json_repair_retries <= 0:
+            return None
+
+        repair_system = (
+            "You are a JSON repair tool. Convert the invalid model output into one valid JSON object.\n"
+            "Return only JSON. Do not add Markdown, explanations, code fences, or comments.\n"
+            "Preserve the original meaning when possible. If fields are missing, use the fallback shape."
+        )
+        repair_user = (
+            "Fallback JSON shape:\n"
+            f"{self._clip(fallback, 4000)}\n\n"
+            "Invalid model output to repair:\n"
+            f"{self._clip(invalid_content, 12000)}\n\n"
+            "Return exactly one valid JSON object now."
+        )
+
+        for repair_index in range(1, self.json_repair_retries + 1):
+            await self._retry_pause(repair_index - 1)
+            started_at = time.perf_counter()
+            operation = f"{original_operation}.json_repair"
+            repair_raw_request = self._raw_request(
+                base_url=base_url,
+                system=repair_system,
+                user=repair_user,
+                temperature=0.0,
+                max_tokens=max(800, min(max_tokens, 2200)),
+                operation=operation,
+                thinking_enabled=False,
+            )
+            log_event(
+                "llm_json_repair_attempt_started",
+                request_id=request_id,
+                operation=original_operation,
+                repair_attempt=repair_index,
+                base_url=base_url,
+            )
+            try:
+                async with httpx.AsyncClient(timeout=self._http_timeout()) as client:
+                    response = await client.post(
+                        f"{base_url}/chat/completions",
+                        json=self._chat_payload(
+                            system=repair_system,
+                            user=repair_user,
+                            temperature=0.0,
+                            max_tokens=max(800, min(max_tokens, 2200)),
+                            thinking_enabled=False,
+                        ),
+                    )
+                duration_ms = round((time.perf_counter() - started_at) * 1000)
+                if not response.is_success:
+                    attempts.append(
+                        {
+                            "attempt": f"repair-{repair_index}",
+                            "base_url": base_url,
+                            "status_code": response.status_code,
+                            "duration_ms": duration_ms,
+                            "error": response.text[:1000],
+                        }
+                    )
+                    log_event(
+                        "llm_json_repair_failed_status",
+                        request_id=request_id,
+                        operation=original_operation,
+                        repair_attempt=repair_index,
+                        status_code=response.status_code,
+                        duration_ms=duration_ms,
+                        response_text=response.text[:1000],
+                    )
+                    continue
+
+                try:
+                    data = response.json()
+                    content = data["choices"][0]["message"]["content"]
+                    parsed = self._parse_json(content)
+                except Exception as exc:
+                    attempts.append(
+                        {
+                            "attempt": f"repair-{repair_index}",
+                            "base_url": base_url,
+                            "status_code": response.status_code,
+                            "duration_ms": duration_ms,
+                            "exception_type": type(exc).__name__,
+                            "error": f"json_repair_parse_failed: {exc}",
+                            "body_excerpt": response.text[:1000],
+                        }
+                    )
+                    log_event(
+                        "llm_json_repair_parse_failed",
+                        request_id=request_id,
+                        operation=original_operation,
+                        repair_attempt=repair_index,
+                        duration_ms=duration_ms,
+                        error=str(exc),
+                    )
+                    continue
+
+                raw_interaction = self._raw_interaction(
+                    request_payload=repair_raw_request,
+                    status_code=response.status_code,
+                    duration_ms=duration_ms,
+                    response_content=content,
+                    response_body={
+                        "usage": data.get("usage"),
+                        "model": data.get("model"),
+                        "original_status_code": original_status_code,
+                        "original_duration_ms": original_duration_ms,
+                        "original_usage": original_data.get("usage"),
+                        "attempts": [
+                            *attempts,
+                            {
+                                "attempt": f"repair-{repair_index}",
+                                "base_url": base_url,
+                                "status_code": response.status_code,
+                                "duration_ms": duration_ms,
+                                "ok": True,
+                            },
+                        ],
+                        "original_raw": self._raw_interaction(
+                            request_payload=raw_request,
+                            status_code=original_status_code,
+                            duration_ms=original_duration_ms,
+                            response_content=invalid_content,
+                            response_body={"usage": original_data.get("usage"), "model": original_data.get("model")},
+                        ),
+                    },
+                )
+                if raw_interaction:
+                    parsed["llm_raw"] = raw_interaction
+                parsed["llm_json_repaired"] = True
+                log_event(
+                    "llm_json_repair_completed",
+                    request_id=request_id,
+                    operation=original_operation,
+                    repair_attempt=repair_index,
+                    duration_ms=duration_ms,
+                    output_keys=list(parsed.keys())[:20],
+                )
+                return parsed
+            except Exception as exc:
+                duration_ms = round((time.perf_counter() - started_at) * 1000)
+                attempts.append(
+                    {
+                        "attempt": f"repair-{repair_index}",
+                        "base_url": base_url,
+                        "duration_ms": duration_ms,
+                        "exception_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                logger.warning(
+                    "llm_json_repair_exception %s",
+                    json.dumps(
+                        {
+                            "request_id": request_id,
+                            "operation": original_operation,
+                            "repair_attempt": repair_index,
+                            "duration_ms": duration_ms,
+                            "base_url": base_url,
+                            "error": str(exc),
+                            "exception_type": type(exc).__name__,
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                )
+        return None
 
     def _fallback_with_raw_output(
         self,

@@ -31,17 +31,20 @@ AGENT_SYSTEMS = {
         COMPLIANCE
         + " あなたは仮説検証プロセスです。既存仮説を、ニュース、開示、財務、株価に照らして検証可能な主張へ分解します。"
         " 仮説タイプがglobalの場合は「この分野やセクターでは○○ではないか」という全体仮説として扱い、companyの場合は個別銘柄仮説として扱います。"
+        " globalではcompanyやtickerがnullであることが正常です。対象銘柄がないことを理由に判断不能にせず、マクロ要因、セクター、企業特性、候補企業群の方向性へ分解してください。"
         " 出力は共通フォーマットのJSONのみ。routing_contextを見てnext_agentを自律的に選びます。finalizeは使わないでください。"
     ),
     "skeptic": (
         COMPLIANCE
         + " あなたは検証・反証エージェントです。もっともらしい成長ストーリーを疑い、反証、織り込み済み、収益性、財務、競争、時間軸のリスクを検出します。"
+        " global仮説では対象銘柄が未指定であること自体を反証にしないでください。セクター仮説、企業特性、候補企業群の選び方、マクロ伝播経路を反証してください。"
         " 出力は共通フォーマットのJSONのみ。finalizeは使わないでください。"
     ),
     "researcher": (
         COMPLIANCE
         + " あなたはリサーチエージェントです。追加調査、根拠統合、最終判断を担当します。データ不足ならnext_action=request_data、next_agent=collectorを指定します。finalizeできるのはあなたのみです。"
         " 十分な根拠と反証が揃っていない場合は、researcherに呼ばれたという理由だけでfinalizeせず、collector、skeptic、hypothesisのいずれかをnext_agentで指定してください。"
+        " global仮説ではcompanyやtickerがnullでも正常です。対象銘柄がないことを理由にfinalizeしないでください。有望セクター、マクロ伝播経路、注目すべき企業特性、候補企業群、追加取得データを統合してください。"
         " 出力は共通フォーマットに加えてfinal_decision、scores、final_reportを含むJSONのみ。"
     ),
 }
@@ -148,6 +151,30 @@ def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
   "questions": [
     {"question": "...", "priority": "high | medium | low", "target_agent": "researcher | skeptic | hypothesis"}
   ],
+  "data_requests": [
+    {
+      "query": "...",
+      "source": "db | web | official | trusted_news | company_disclosure | market_data | document_body",
+      "reason": "...",
+      "priority": "high | medium | low"
+    }
+  ],
+  "global_analysis": {
+    "promising_sectors": [
+      {
+        "sector": "...",
+        "thesis": "...",
+        "macro_drivers": ["..."],
+        "transmission_path": "マクロ要因が収益・需給・バリュエーションへ伝わる経路",
+        "beneficiary_company_traits": ["価格転嫁力", "在庫優位", "海外売上比率など"],
+        "candidate_company_groups": [
+          {"trait": "企業条件", "example_tickers": ["1234"], "example_names": ["会社名"], "reason": "..."}
+        ],
+        "risks": ["..."],
+        "required_data": ["..."]
+      }
+    ]
+  },
   "next_action": "call_agent | request_data | finalize | stop",
   "next_agent": "hypothesis | skeptic | researcher | collector | null",
   "reason_for_next_action": "...",
@@ -198,9 +225,12 @@ researcherの場合は次も含めてください:
 - データ不足で新たな取得が必要な場合はnext_actionをrequest_data、next_agentをcollectorにする
 - ニュースがタイトル/URLだけで本文根拠が不足している場合もcollectorに本文取得を要求する
 - 「collectorによる取得が必須」「一次情報が不足」「財務データが不足」などと判断する場合は、finalizeやstopを使わずrequest_dataを選ぶ
-- collectorに渡すため、missing_informationとrecommended_next_researchには検索対象を具体的に書く。例: ナフサ価格、政府答弁、国会会議録、化学企業の営業利益率、価格転嫁、在庫統計
+- collectorに渡すため、data_requestsに検索・取得対象を具体的に書く。Collectorは情報・ニュース・文書本文・公式統計・指定銘柄データの取得担当であり、候補企業群の選定や統合判断はhypothesis/skeptic/researcherが行う
+- 指定銘柄の追加取得が必要な場合は、data_requestsにtickerまたは会社名を明示する。Collectorに「候補企業を選べ」と依頼しない
 - collector実行後は、取得結果に応じて反証、再仮説化、統合のどれが必要かを判断する
-- hypothesis_typeがglobalの場合、context.macro_indicators、context.sector_snapshots、context.recent_events、documentsを使い、「有望セクター候補」「根拠」「反証」「代表銘柄・波及先」「不足データ」を分ける
+- hypothesis_typeがglobalの場合、company=null/ticker=nullは正常であり、不足情報や失敗理由にしてはいけない
+- hypothesis_typeがglobalの場合、context.macro_indicators、context.sector_snapshots、context.recent_events、documents、companiesを使い、「有望セクター候補」「マクロ伝播経路」「根拠」「反証」「注目すべき企業特性」「候補企業群・代表例」「不足データ」を分ける
+- global仮説で個別企業評価が未確定な場合でも、「どのような企業を深掘りすべきか」と「入力companiesから見える代表例」を出す
 - documentsとcontextが不足している場合は一般論で有望セクターを断定せず、request_dataまたはinconclusiveとして不足データを具体的に列挙する
 - hypothesis_typeがcompanyの場合、個別銘柄の業績、株価、開示、ニュースとの整合性を優先する
 - researcherがfinalizeできるのは、主要な根拠と主要な反証が両方あり、追加取得すべき高優先度データが結論を左右しない場合だけ

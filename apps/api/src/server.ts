@@ -337,6 +337,15 @@ function companyDiscoveryScore(company: Company, focus?: string, sector?: string
   );
 }
 
+function companyUniverseForGlobalHypothesis(companies: Company[], focus?: string, sector?: string, limit = 90): Company[] {
+  const normalizedLimit = Math.max(20, Math.min(Number.isFinite(limit) ? Math.floor(limit) : 90, 180));
+  return companies
+    .map((company) => ({ company, score: companyDiscoveryScore(company, focus, sector) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, normalizedLimit)
+    .map((item) => item.company);
+}
+
 function discoveryContextSummary(payload: JsonRecord): JsonRecord {
   const context = asJsonRecord(payload.context);
   return {
@@ -362,7 +371,7 @@ type LlmAgentName = "hypothesis" | "skeptic" | "researcher";
 type AgentName = LlmAgentName | "collector";
 
 const HYPOTHESIS_LOOP_INSTRUCTION =
-  "仮説検証、反証、深堀り・リサーチ、データ収集の工程がnext_agentで互いに呼び出しあいます。各工程はrouting_contextを見て、次に呼ぶべき工程を自律的に指定してください。データ不足ならnext_action=request_dataでcollectorを指定できます。collectorは不足情報に応じて、政策・公的統計・信頼ニュース本文・セクター代表企業の決算/株価/ニュースを追加取得します。finalizeできるのはresearcherだけですが、根拠と反証が不足している場合はfinalizeせず次工程を指定してください。";
+  "仮説検証、反証、深堀り・リサーチ、データ収集の工程がnext_agentで互いに呼び出しあいます。各工程はrouting_contextを見て、次に呼ぶべき工程を自律的に指定してください。データ不足ならnext_action=request_dataでcollectorを指定できます。collectorは不足情報に応じて、政策・公的統計・信頼ニュース本文・指定された銘柄の決算/株価/ニュースを追加取得します。候補企業群の整理や統合判断はhypothesis/skeptic/researcherが担当します。finalizeできるのはresearcherだけですが、根拠と反証が不足している場合はfinalizeせず次工程を指定してください。";
 const HYPOTHESIS_FINALIZE_INSTRUCTION =
   "ここまでの仮説検証・反証を統合してください。根拠と反証が結論に十分ならresearcherとしてfinal_decisionとfinal_reportを出し、不足が結論を左右する場合はfinalizeせず次工程を指定してください。";
 
@@ -459,6 +468,8 @@ function loopOutputExcerpt(output: JsonRecord): JsonRecord {
     reason: trimText(output.reason ?? output.reason_for_next_action, 400),
     claims: compactRecordList(output.claims, 5, ["claim", "evidence_ids", "confidence"]),
     questions: compactRecordList(output.questions, 5, ["question", "priority", "target_agent"]),
+    global_analysis: Object.keys(asJsonRecord(output.global_analysis)).length ? asJsonRecord(output.global_analysis) : undefined,
+    data_requests: compactRecordList(output.data_requests, 6, ["query", "source", "ticker", "reason", "priority"]),
     missing_information: compactTextList(output.missing_information, 6),
     recommended_next_research: compactTextList(output.recommended_next_research, 6),
     scores: Object.keys(asJsonRecord(output.scores)).length ? asJsonRecord(output.scores) : undefined,
@@ -504,7 +515,19 @@ function appendTextParts(target: string[], value: unknown): void {
   }
   if (value && typeof value === "object") {
     const record = value as JsonRecord;
-    appendTextParts(target, record.question ?? record.claim ?? record.title ?? record.summary);
+    appendTextParts(
+      target,
+      record.query ??
+        record.question ??
+        record.claim ??
+        record.title ??
+        record.summary ??
+        record.reason ??
+        record.description ??
+        record.target ??
+        record.source ??
+        record.url
+    );
   }
 }
 
@@ -522,6 +545,8 @@ function collectorTextCorpus(basePayload: JsonRecord, previousOutput: JsonRecord
   appendTextParts(parts, previousOutput?.missing_information);
   appendTextParts(parts, previousOutput?.recommended_next_research);
   appendTextParts(parts, previousOutput?.questions);
+  appendTextParts(parts, previousOutput?.data_requests);
+  appendTextParts(parts, previousOutput?.tool_calls);
   appendTextParts(parts, previousOutput?.claims);
   appendTextParts(parts, previousOutput?.reason);
   appendTextParts(parts, previousOutput?.reason_for_next_action);
@@ -570,11 +595,6 @@ function uniqueLimited(values: string[], limit: number): string[] {
 function collectorMaxThematicQueries(): number {
   const configured = Number(process.env.COLLECTOR_MAX_THEMATIC_QUERIES ?? 4);
   return Math.max(1, Math.min(Number.isFinite(configured) ? Math.floor(configured) : 4, 8));
-}
-
-function collectorGlobalCompanyLimit(): number {
-  const configured = Number(process.env.COLLECTOR_GLOBAL_COMPANY_LIMIT ?? 4);
-  return Math.max(0, Math.min(Number.isFinite(configured) ? Math.floor(configured) : 4, 10));
 }
 
 function collectorBodyFetchLimit(): number {
@@ -738,9 +758,17 @@ function collectorDataRequirements(topicText: string): string[] {
   return [...requirements];
 }
 
-function collectorThematicQueries(baseQuery: string, topicText: string): Array<{ query: string; reason: string }> {
+function collectorThematicQueries(baseQuery: string, topicText: string, dataRequests: JsonRecord[] = []): Array<{ query: string; reason: string }> {
   const text = topicText.toLowerCase();
   const queries: Array<{ query: string; reason: string }> = [];
+  dataRequests.forEach((request) => {
+    const query = collectorRequestQuery(request);
+    if (!query) return;
+    queries.push({
+      query,
+      reason: trimText(request.reason, 180) ?? "前工程のdata_requestsから作成した検索"
+    });
+  });
   if (baseQuery && baseQuery !== "Japan") {
     queries.push({ query: baseQuery, reason: "仮説本文と不足情報から作成した基礎検索" });
   }
@@ -772,85 +800,393 @@ function collectorThematicQueries(baseQuery: string, topicText: string): Array<{
   });
 }
 
-function collectorSectorTerms(topicText: string, sector?: string): string[] {
-  const text = topicText.toLowerCase();
-  const terms = new Set<string>();
-  if (sector) terms.add(sector);
-  if (includesAny(text, ["化学", "ナフサ", "naphtha", "石油化学", "エチレン", "原料"])) {
-    ["化学", "素材", "石油", "石炭", "石油化学"].forEach((term) => terms.add(term));
-  }
-  if (includesAny(text, ["半導体", "電子材料"])) {
-    ["半導体", "電気機器", "電子材料", "精密"].forEach((term) => terms.add(term));
-  }
-  if (includesAny(text, ["防衛", "安全保障"])) {
-    ["機械", "電気機器", "輸送用機器", "防衛"].forEach((term) => terms.add(term));
-  }
-  return [...terms].map((term) => term.trim()).filter(Boolean);
-}
-
-function companyTopicScore(company: Company, topicText: string, sector?: string): number {
-  const terms = collectorSectorTerms(topicText, sector);
-  const haystack = `${company.sector ?? ""} ${company.industry ?? ""} ${company.name ?? ""} ${company.english_name ?? ""} ${company.business_summary ?? ""}`.toLowerCase();
-  const metrics = asJsonRecord(company.latest_metrics);
-  const termScore = terms.reduce((score, term) => score + (haystack.includes(term.toLowerCase()) ? 25 : 0), 0);
-  return (
-    termScore +
-    (numberValue(metrics.operating_profit_growth) ?? 0) * 0.6 +
-    (numberValue(metrics.revenue_growth) ?? 0) * 0.35 +
-    (numberValue(metrics.operating_margin) ?? 0) * 0.2 +
-    Math.min(10, Math.log10(Math.max(1, numberValue(company.market_cap) ?? 1)))
-  );
-}
-
-async function collectSectorCompanyFoundation(params: {
-  topicText: string;
+type CollectorTurnParams = {
+  basePayload: JsonRecord;
+  previousOutput: JsonRecord | null;
+  hypothesisType: string;
+  ticker: string | null;
   sector?: string;
   since: string;
   lookbackDays: number;
   documentLimit: number;
-}): Promise<{ selectedCompanies: Company[]; documents: DocumentRecord[]; operations: JsonRecord[]; errors: string[] }> {
-  const limit = collectorGlobalCompanyLimit();
-  if (limit <= 0) return { selectedCompanies: [], documents: [], operations: [], errors: [] };
+  priceLimit: number;
+};
 
-  const companies = await listCompanies(2000);
-  const selectedCompanies = companies
-    .map((company) => ({ company, score: companyTopicScore(company, params.topicText, params.sector) }))
-    .filter((item) => item.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit)
-    .map((item) => item.company);
-  const operations: JsonRecord[] = [];
-  const errors: string[] = [];
-  const documents: DocumentRecord[] = [];
+type CollectorToolName =
+  | "db.reload_company_context"
+  | "db.reload_global_context"
+  | "market.fetch_company_foundation"
+  | "net.fetch_macro_data"
+  | "net.search_company_news"
+  | "net.search_thematic_news"
+  | "net.fetch_document_bodies";
 
-  for (const company of selectedCompanies) {
-    try {
-      const result = await fetchCompanyFoundation(company.ticker, {
+type CollectorToolCall = {
+  id: string;
+  name: CollectorToolName;
+  input: JsonRecord;
+  reason: string;
+  requested_by_agent?: string | null;
+};
+
+type CollectorToolResult = {
+  tool_call_id: string;
+  tool_name: CollectorToolName;
+  ok: boolean;
+  duration_ms: number;
+  input: JsonRecord;
+  result?: JsonRecord;
+  error?: string;
+};
+
+type CollectorToolContext = {
+  params: CollectorTurnParams;
+  topicText: string;
+  query: string;
+  dataRequirements: string[];
+  thematicQueries: Array<{ query: string; reason: string }>;
+  dataRequests: JsonRecord[];
+  nextPayload: JsonRecord;
+  collectedNewsDocuments: DocumentRecord[];
+  companyDocuments: DocumentRecord[];
+};
+
+type CollectorTool = {
+  description: string;
+  source: "db" | "network" | "mixed";
+  execute: (context: CollectorToolContext, call: CollectorToolCall) => Promise<JsonRecord>;
+};
+
+function collectorRequestQuery(request: JsonRecord): string | null {
+  return trimText(
+    request.query ??
+      request.question ??
+      request.title ??
+      request.target ??
+      request.description ??
+      request.reason ??
+      request.claim,
+    220
+  );
+}
+
+function collectorStructuredRequests(previousOutput: JsonRecord | null): JsonRecord[] {
+  if (!previousOutput) return [];
+  const requests: JsonRecord[] = [];
+  const pushRecord = (value: unknown, sourceHint?: string) => {
+    if (typeof value === "string") {
+      const query = trimText(value, 220);
+      if (query) requests.push({ query, source: sourceHint ?? "web", reason: "前工程の不足情報から生成" });
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.slice(0, 16).forEach((item) => pushRecord(item, sourceHint));
+      return;
+    }
+    const record = asJsonRecord(value);
+    const query = collectorRequestQuery(record);
+    if (!query) return;
+    requests.push({
+      ...record,
+      query,
+      source: typeof record.source === "string" ? record.source : sourceHint ?? "web",
+      reason: trimText(record.reason ?? record.summary ?? record.description, 260) ?? "前工程からのCollector要求"
+    });
+  };
+
+  pushRecord(previousOutput.data_requests);
+  pushRecord(previousOutput.tool_calls);
+  pushRecord(previousOutput.missing_information, "db");
+  pushRecord(previousOutput.recommended_next_research, "web");
+  pushRecord(previousOutput.questions, "db");
+
+  const seen = new Set<string>();
+  return requests.filter((request) => {
+    const key = `${request.source ?? ""}:${collectorRequestQuery(request) ?? ""}`.toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function collectorAvailableTools(): JsonRecord[] {
+  return Object.entries(collectorTools).map(([name, tool]) => ({
+    name,
+    source: tool.source,
+    description: tool.description
+  }));
+}
+
+function collectorRequestedTickers(dataRequests: JsonRecord[]): string[] {
+  const tickers = new Set<string>();
+  for (const request of dataRequests) {
+    const source = String(request.source ?? "").toLowerCase();
+    const query = [
+      request.ticker,
+      request.query,
+      request.target,
+      request.company,
+      request.company_name,
+      request.reason
+    ]
+      .map((value) => String(value ?? ""))
+      .join(" ");
+    const sourceLooksCompanySpecific = /company|disclosure|market_data|ticker|銘柄|企業|開示|決算/.test(source);
+    const matches = [...query.matchAll(/(?:^|[^\d])(\d{4,5})(?:\.T)?(?:[^\d]|$)/g)].map((match) => normalizeTicker(match[1]));
+    if (sourceLooksCompanySpecific || matches.length) matches.forEach((ticker) => tickers.add(ticker));
+  }
+  return [...tickers].filter(Boolean).slice(0, 8);
+}
+
+function makeCollectorToolCall(
+  index: number,
+  name: CollectorToolName,
+  input: JsonRecord,
+  reason: string,
+  requestedByAgent?: string | null
+): CollectorToolCall {
+  return {
+    id: `collector_tool_${String(index + 1).padStart(2, "0")}`,
+    name,
+    input,
+    reason,
+    requested_by_agent: requestedByAgent
+  };
+}
+
+function planCollectorToolCalls(context: CollectorToolContext): CollectorToolCall[] {
+  const calls: CollectorToolCall[] = [];
+  const requestedByAgent = typeof context.params.previousOutput?.agent_name === "string" ? context.params.previousOutput.agent_name : null;
+  const add = (name: CollectorToolName, input: JsonRecord, reason: string) => {
+    calls.push(makeCollectorToolCall(calls.length, name, input, reason, requestedByAgent));
+  };
+
+  if (context.params.hypothesisType === "company" && context.params.ticker) {
+    add("market.fetch_company_foundation", { ticker: context.params.ticker }, "対象企業の基礎情報、決算、株価を取得する");
+    add("net.search_company_news", { ticker: context.params.ticker, query: context.query }, "対象企業に関するニュースを過去期間で検索する");
+    add("db.reload_company_context", { ticker: context.params.ticker, phase: "after_network_search" }, "DBから企業文書と株価を再読込する");
+    add("net.fetch_document_bodies", { scope: "company", terms: collectorBodySearchTerms(context.topicText).slice(0, 12) }, "タイトル/URLのみの文書から本文を取得する");
+    add("db.reload_company_context", { ticker: context.params.ticker, phase: "after_body_fetch" }, "本文取得後の文書をDBから再読込する");
+    return calls;
+  }
+
+  add("net.fetch_document_bodies", { scope: "existing_payload", terms: collectorBodySearchTerms(context.topicText).slice(0, 12) }, "既に渡された文書の本文を優先取得する");
+  add("net.fetch_macro_data", {}, "マクロ指数、金利、為替、商品市況を取得する");
+  context.thematicQueries.forEach((thematicQuery) => {
+    add(
+      "net.search_thematic_news",
+      { query: thematicQuery.query, lookback_days: context.params.lookbackDays },
+      thematicQuery.reason
+    );
+  });
+  collectorRequestedTickers(context.dataRequests).forEach((ticker) => {
+    add("market.fetch_company_foundation", { ticker }, "他Agentが指定した銘柄の基礎情報、決算、株価、ニュースを取得する");
+  });
+  add("net.fetch_document_bodies", { scope: "global", terms: collectorBodySearchTerms(context.topicText).slice(0, 12) }, "検索・DB再読込で得たニュースや一次情報の本文を取得する");
+  add(
+    "db.reload_global_context",
+    { search: globalSearchTerm(context.params.sector) ?? (context.query === "Japan" ? null : context.query), sector: context.params.sector ?? null },
+    "DBから文書、マクロ、セクター、イベントを再読込して次工程へ渡す"
+  );
+  return calls;
+}
+
+async function executeCollectorTool(context: CollectorToolContext, call: CollectorToolCall): Promise<CollectorToolResult> {
+  const startedAt = Date.now();
+  const tool = collectorTools[call.name];
+  try {
+    const result = await tool.execute(context, call);
+    return {
+      tool_call_id: call.id,
+      tool_name: call.name,
+      ok: true,
+      duration_ms: Date.now() - startedAt,
+      input: call.input,
+      result
+    };
+  } catch (error) {
+    return {
+      tool_call_id: call.id,
+      tool_name: call.name,
+      ok: false,
+      duration_ms: Date.now() - startedAt,
+      input: call.input,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function collectorResultErrors(result: CollectorToolResult): string[] {
+  if (!result.ok) return [`${result.tool_name}: ${result.error ?? "unknown error"}`];
+  const directErrors = Array.isArray(result.result?.errors) ? result.result.errors : [];
+  const nested = asJsonRecord(result.result?.result);
+  const nestedErrors = Array.isArray(nested.errors) ? nested.errors : [];
+  return [...directErrors, ...nestedErrors].map((error) => `${result.tool_name}: ${String(error)}`);
+}
+
+const collectorTools: Record<CollectorToolName, CollectorTool> = {
+  "market.fetch_company_foundation": {
+    source: "network",
+    description: "J-Quantsから企業基礎情報、決算、株価、企業ニュースを取得してDBへ保存する",
+    async execute(context, call) {
+      const ticker = normalizeOptionalTicker(call.input.ticker) ?? context.params.ticker;
+      if (!ticker) return { skipped: true, reason: "ticker_missing" };
+      const result = await fetchCompanyFoundation(ticker, {
         includePrices: true,
         includeStatements: true,
         includeNews: true,
-        newsLookbackDays: params.lookbackDays,
-        newsLimit: Math.min(120, Math.max(40, params.documentLimit))
+        newsLookbackDays: context.params.lookbackDays,
+        newsLimit: Math.min(300, Math.max(80, context.params.documentLimit * 2))
       });
-      operations.push({ operation: "fetch_sector_company_foundation", ticker: company.ticker, name: company.name, sector: company.sector, result });
-    } catch (error) {
-      errors.push(`fetch_sector_company_foundation(${company.ticker}): ${error instanceof Error ? error.message : String(error)}`);
+      return { result };
+    }
+  },
+  "net.search_company_news": {
+    source: "network",
+    description: "GDELT/RSSなどから企業関連ニュースを検索してDBへ保存する",
+    async execute(context, call) {
+      const ticker = normalizeOptionalTicker(call.input.ticker) ?? context.params.ticker;
+      if (!ticker) return { skipped: true, reason: "ticker_missing" };
+      const result = await fetchAndSaveCompanyNews(ticker, {
+        query: typeof call.input.query === "string" ? call.input.query : context.query,
+        lookbackDays: context.params.lookbackDays,
+        limit: Math.min(300, Math.max(80, context.params.documentLimit * 2))
+      });
+      return compactNewsFetchResult(result as JsonRecord);
+    }
+  },
+  "db.reload_company_context": {
+    source: "db",
+    description: "DBから企業、文書、株価を再読込して次工程のpayloadを更新する",
+    async execute(context, call) {
+      const ticker = normalizeOptionalTicker(call.input.ticker) ?? context.params.ticker;
+      if (!ticker) return { skipped: true, reason: "ticker_missing" };
+      const [documents, prices, company] = await Promise.all([
+        listDocuments({ ticker, limit: Math.min(500, context.params.documentLimit * 2), since: context.params.since }),
+        getPrices(ticker),
+        getCompany(ticker)
+      ]);
+      context.companyDocuments = documents;
+      context.nextPayload.documents = mergeCompactDocuments(context.nextPayload.documents, documents, context.params.documentLimit);
+      context.nextPayload.prices = prices.slice(-context.params.priceLimit);
+      context.nextPayload.company = company ?? context.nextPayload.company ?? null;
+      return { documents: documents.length, prices: prices.length, company: company ? { ticker: company.ticker, name: company.name } : null };
+    }
+  },
+  "net.fetch_document_bodies": {
+    source: "mixed",
+    description: "DBまたはpayload上の文書URLへアクセスし、本文を抽出してDBへ保存する",
+    async execute(context, call) {
+      const scope = typeof call.input.scope === "string" ? call.input.scope : "global";
+      const terms = collectorBodySearchTerms(context.topicText);
+      let candidates: DocumentRecord[] = [];
+
+      if (scope === "company") {
+        candidates = context.companyDocuments.length
+          ? context.companyDocuments
+          : context.params.ticker
+            ? await listDocuments({ ticker: context.params.ticker, limit: Math.min(500, context.params.documentLimit * 2), since: context.params.since })
+            : [];
+      } else if (scope === "existing_payload") {
+        candidates = payloadDocumentsForBodyFetch(context.params.basePayload);
+      } else {
+        const [targetedBodyCandidates, macroBodyCandidates, ...searchedBodyCandidateGroups] = await Promise.all([
+          listDocuments({ sourceType: "news", search: globalSearchTerm(context.params.sector), sector: globalSearchTerm(context.params.sector), limit: 140, since: context.params.since }),
+          listMacroNews(100),
+          ...terms.slice(0, 8).map((term) => listDocuments({ sourceType: "news", search: term, limit: 80, since: context.params.since }))
+        ]);
+        candidates = [
+          ...payloadDocumentsForBodyFetch(context.params.basePayload),
+          ...context.collectedNewsDocuments,
+          ...targetedBodyCandidates,
+          ...macroBodyCandidates,
+          ...searchedBodyCandidateGroups.flat()
+        ];
+      }
+
+      const bodyCandidates = prioritizeBodyFetchDocuments(candidates, context.topicText);
+      if (!bodyCandidates.length) {
+        return {
+          scope,
+          skipped: true,
+          reason: "no_relevant_body_candidates",
+          terms: terms.slice(0, 12),
+          candidates_preview: []
+        };
+      }
+
+      const result = await fetchAndCacheDocumentBodies(bodyCandidates, {
+        limit: collectorBodyFetchLimit(),
+        maxChars: collectorBodyMaxChars()
+      });
+      return {
+        scope,
+        terms: terms.slice(0, 12),
+        candidates_preview: bodyFetchPreview(bodyCandidates, context.topicText),
+        result
+      };
+    }
+  },
+  "net.fetch_macro_data": {
+    source: "network",
+    description: "マクロ指数、為替、金利、商品市況、公式RSSを取得してDBへ保存する",
+    async execute() {
+      const result = await fetchMacroData();
+      return { result };
+    }
+  },
+  "net.search_thematic_news": {
+    source: "network",
+    description: "仮説・不足情報に基づくテーマ検索で、信頼ニュースと過去ニュースをDBへ保存する",
+    async execute(context, call) {
+      const query = typeof call.input.query === "string" ? call.input.query : context.query;
+      if (!query || query === "Japan") return { skipped: true, reason: "query_empty_or_too_broad", query };
+      const result = await fetchAndSaveMacroNews({
+        query,
+        lookbackDays: context.params.lookbackDays,
+        limit: Math.min(220, Math.max(60, context.params.documentLimit))
+      });
+      if (Array.isArray(result.documents)) context.collectedNewsDocuments.push(...(result.documents as DocumentRecord[]));
+      return { query, result: compactNewsFetchResult(result as JsonRecord) };
+    }
+  },
+  "db.reload_global_context": {
+    source: "db",
+    description: "DBから文書、マクロ指標、セクター集計、イベントを再読込して次工程のpayloadを更新する",
+    async execute(context, call) {
+      const requestedSearch = typeof call.input.search === "string" && call.input.search.trim() ? call.input.search.trim() : undefined;
+      const refreshed = await reloadGlobalResearchContext({
+        search: requestedSearch,
+        sector: context.params.sector,
+        since: context.params.since,
+        documentLimit: context.params.documentLimit
+      });
+      context.nextPayload.documents = mergeCompactDocuments(
+        context.nextPayload.documents,
+        refreshed.documents as unknown as DocumentRecord[],
+        context.params.documentLimit
+      );
+      context.nextPayload.context = {
+        ...refreshed.context,
+        collector_focus: {
+          query: context.query,
+          data_requirements: context.dataRequirements,
+          data_requests: context.dataRequests,
+          thematic_queries: context.thematicQueries,
+          available_tools: collectorAvailableTools(),
+          topic_excerpt: trimText(context.topicText, 900)
+        }
+      };
+      const payloadContext = asJsonRecord(context.nextPayload.context);
+      return {
+        documents: Array.isArray(context.nextPayload.documents) ? context.nextPayload.documents.length : 0,
+        macro_indicators: Array.isArray(payloadContext.macro_indicators) ? payloadContext.macro_indicators.length : 0,
+        sector_snapshots: Array.isArray(payloadContext.sector_snapshots) ? payloadContext.sector_snapshots.length : 0,
+        recent_events: Array.isArray(payloadContext.recent_events) ? payloadContext.recent_events.length : 0
+      };
     }
   }
-
-  const documentGroups = await Promise.all(
-    selectedCompanies.map((company) => listDocuments({ ticker: company.ticker, limit: 40, since: params.since }).catch(() => []))
-  );
-  documents.push(...documentGroups.flat());
-  if (selectedCompanies.length) {
-    operations.push({
-      operation: "reload_sector_company_documents",
-      tickers: selectedCompanies.map((company) => company.ticker),
-      documents: documents.length
-    });
-  }
-  return { selectedCompanies, documents, operations, errors };
-}
+};
 
 function mergeCompactDocuments(existing: unknown, documents: DocumentRecord[], limit: number): JsonRecord[] {
   const merged: JsonRecord[] = [];
@@ -926,7 +1262,9 @@ function outputTextForRouting(output: JsonRecord): string {
       output.final_report,
       output.missing_information,
       output.recommended_next_research,
-      output.questions
+      output.questions,
+      output.data_requests,
+      output.tool_calls
     ]
       .map((value) => {
         if (Array.isArray(value)) return value.map((item) => (typeof item === "string" ? item : JSON.stringify(item))).join(" ");
@@ -935,6 +1273,18 @@ function outputTextForRouting(output: JsonRecord): string {
       })
       .join(" ")
   ).toLowerCase();
+}
+
+function globalCompanyMissingBlocker(output: JsonRecord): boolean {
+  const text = outputTextForRouting(output);
+  const treatsMissingCompanyAsBlocker =
+    /(調査対象企業|対象企業|対象銘柄|個別銘柄|company|ticker).{0,50}(未設定|未指定|特定されていない|特定がない|指定がない|存在しない|ないため)/.test(
+      text
+    ) ||
+    /(個別企業|個別銘柄).{0,50}(評価|分析|判断).{0,30}(できない|できません|不可能)/.test(text) ||
+    /(対象銘柄|対象企業).{0,50}(ないため|ないので).{0,50}(評価|分析|判断).{0,30}(できない|できません|不可能)/.test(text);
+  if (!treatsMissingCompanyAsBlocker) return false;
+  return !/(候補企業群|企業特性|有望セクター|マクロ伝播|代表例|promising_sectors|candidate_company_groups|beneficiary_company_traits)/.test(text);
 }
 
 function shouldRerouteResearcherToCollector(agentName: AgentName, output: JsonRecord, agentRuns: JsonRecord[]): boolean {
@@ -998,7 +1348,7 @@ function routingContext(agentName: AgentName, agentRuns: JsonRecord[]): JsonReco
       },
       {
         name: "collector",
-        role: "外部データ取得・DB再読込を行う非LLM工程。政策・公的統計・信頼ニュース・ニュース本文・セクター代表企業の決算/株価/ニュースを追加取得する"
+        role: "外部データ取得・DB再読込を行う非LLM工程。data_requestsを読み、DB検索、ネット検索、記事本文取得、指定銘柄の企業基礎データ取得などの関数ツールを実行する"
       }
     ],
     routing_guidance: [
@@ -1007,6 +1357,9 @@ function routingContext(agentName: AgentName, agentRuns: JsonRecord[]): JsonReco
       "データ不足で判断できない場合はcollectorを呼ぶ",
       "collectorで取得したデータは、反証または統合のどちらに渡すべきかを次工程で判断する",
       "ニュースがタイトル/URLだけで本文根拠が不足する場合はcollectorで本文取得を要求する",
+      "collectorに渡す要求はdata_requestsへ query/source/reason/priority を具体的に書く",
+      "候補企業群の整理、代表企業の選定、セクター内の勝ち筋の統合はhypothesis/skeptic/researcherが行い、collectorに丸投げしない",
+      "global仮説ではcompany/ticker未指定が正常なので、それだけを理由に判断不能にしない",
       "finalizeはresearcherのみが使う",
       "researcherでも、主要な根拠と主要な反証が不足している場合はfinalizeせず次工程を指定する",
       "final_report内でCollector必須、一次情報不足、財務データ不足と述べる場合はfinalizeせずrequest_dataを指定する",
@@ -1021,194 +1374,48 @@ function routingContext(agentName: AgentName, agentRuns: JsonRecord[]): JsonReco
   };
 }
 
-async function runCollectorTurn(params: {
-  basePayload: JsonRecord;
-  previousOutput: JsonRecord | null;
-  hypothesisType: string;
-  ticker: string | null;
-  sector?: string;
-  since: string;
-  lookbackDays: number;
-  documentLimit: number;
-  priceLimit: number;
-}): Promise<{ output: JsonRecord; payload: JsonRecord }> {
+async function runCollectorTurn(params: CollectorTurnParams): Promise<{ output: JsonRecord; payload: JsonRecord }> {
   const startedAt = Date.now();
   const topicText = normalizeCollectorText(collectorTextCorpus(params.basePayload, params.previousOutput));
   const query = collectorQuery(params.basePayload, params.previousOutput);
+  const dataRequests = collectorStructuredRequests(params.previousOutput);
   const dataRequirements = collectorDataRequirements(topicText);
-  const thematicQueries = collectorThematicQueries(query, topicText);
-  const errors: string[] = [];
-  const operations: JsonRecord[] = [];
-  const collectedNewsDocuments: DocumentRecord[] = [];
+  const thematicQueries = collectorThematicQueries(query, topicText, dataRequests);
   const nextPayload: JsonRecord = { ...params.basePayload };
 
-  if (params.hypothesisType === "company" && params.ticker) {
-    try {
-      const result = await fetchCompanyFoundation(params.ticker, {
-        includePrices: true,
-        includeStatements: true,
-        includeNews: true,
-        newsLookbackDays: params.lookbackDays,
-        newsLimit: Math.min(300, Math.max(80, params.documentLimit * 2))
-      });
-      operations.push({ operation: "fetch_company_foundation", result });
-    } catch (error) {
-      errors.push(`fetch_company_foundation: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    try {
-      const result = await fetchAndSaveCompanyNews(params.ticker, {
-        query,
-        lookbackDays: params.lookbackDays,
-        limit: Math.min(300, Math.max(80, params.documentLimit * 2))
-      });
-      operations.push({ operation: "fetch_company_news", query, result });
-    } catch (error) {
-      errors.push(`fetch_company_news: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    let [documents, prices] = await Promise.all([
-      listDocuments({ ticker: params.ticker, limit: Math.min(500, params.documentLimit * 2), since: params.since }),
-      getPrices(params.ticker)
-    ]);
-    try {
-      const bodyCandidates = prioritizeBodyFetchDocuments(documents, topicText);
-      const result = await fetchAndCacheDocumentBodies(bodyCandidates, {
-        limit: collectorBodyFetchLimit(),
-        maxChars: collectorBodyMaxChars()
-      });
-      operations.push({
-        operation: "fetch_document_bodies",
-        scope: "company",
-        terms: collectorBodySearchTerms(topicText).slice(0, 12),
-        candidates_preview: bodyFetchPreview(bodyCandidates, topicText),
-        result
-      });
-      if (result.fetched > 0) {
-        documents = await listDocuments({ ticker: params.ticker, limit: Math.min(500, params.documentLimit * 2), since: params.since });
-      }
-    } catch (error) {
-      errors.push(`fetch_document_bodies(company): ${error instanceof Error ? error.message : String(error)}`);
-    }
-    nextPayload.documents = mergeCompactDocuments(nextPayload.documents, documents, params.documentLimit);
-    nextPayload.prices = prices.slice(-params.priceLimit);
-    nextPayload.company = (await getCompany(params.ticker)) ?? nextPayload.company ?? null;
-    operations.push({ operation: "reload_company_context", documents: documents.length, prices: prices.length });
-  } else {
-    try {
-      const existingBodyCandidates = prioritizeBodyFetchDocuments(payloadDocumentsForBodyFetch(params.basePayload), topicText);
-      if (existingBodyCandidates.length) {
-        const result = await fetchAndCacheDocumentBodies(existingBodyCandidates, {
-          limit: collectorBodyFetchLimit(),
-          maxChars: collectorBodyMaxChars()
-        });
-        operations.push({
-          operation: "fetch_document_bodies",
-          scope: "existing_payload",
-          terms: collectorBodySearchTerms(topicText).slice(0, 12),
-          candidates_preview: bodyFetchPreview(existingBodyCandidates, topicText),
-          result
-        });
-      }
-    } catch (error) {
-      errors.push(`fetch_document_bodies(existing_payload): ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    try {
-      const result = await fetchMacroData();
-      operations.push({ operation: "fetch_macro_data", result });
-    } catch (error) {
-      errors.push(`fetch_macro_data: ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    for (const thematicQuery of thematicQueries) {
-      if (!thematicQuery.query || thematicQuery.query === "Japan") continue;
-      try {
-        const result = await fetchAndSaveMacroNews({
-          query: thematicQuery.query,
-          lookbackDays: params.lookbackDays,
-          limit: Math.min(220, Math.max(60, params.documentLimit))
-        });
-        if (Array.isArray(result.documents)) collectedNewsDocuments.push(...result.documents);
-        operations.push({ operation: "fetch_thematic_news", query: thematicQuery.query, reason: thematicQuery.reason, result: compactNewsFetchResult(result as JsonRecord) });
-      } catch (error) {
-        errors.push(`fetch_thematic_news(${thematicQuery.query}): ${error instanceof Error ? error.message : String(error)}`);
-      }
-    }
-
-    const sectorFoundation = await collectSectorCompanyFoundation({
-      topicText,
-      sector: params.sector,
-      since: params.since,
-      lookbackDays: params.lookbackDays,
-      documentLimit: params.documentLimit
-    });
-    operations.push(...sectorFoundation.operations);
-    errors.push(...sectorFoundation.errors);
-
-    try {
-      const bodySearchTerms = collectorBodySearchTerms(topicText);
-      const [targetedBodyCandidates, macroBodyCandidates, ...searchedBodyCandidateGroups] = await Promise.all([
-        listDocuments({ sourceType: "news", search: globalSearchTerm(params.sector), limit: 140, since: params.since }),
-        listMacroNews(100),
-        ...bodySearchTerms.slice(0, 8).map((term) => listDocuments({ sourceType: "news", search: term, limit: 80, since: params.since }))
-      ]);
-      const bodyCandidates = prioritizeBodyFetchDocuments(
-        [
-          ...payloadDocumentsForBodyFetch(params.basePayload),
-          ...collectedNewsDocuments,
-          ...sectorFoundation.documents,
-          ...targetedBodyCandidates,
-          ...macroBodyCandidates,
-          ...searchedBodyCandidateGroups.flat()
-        ],
-        topicText
-      );
-      const result = await fetchAndCacheDocumentBodies(
-        bodyCandidates,
-        {
-          limit: collectorBodyFetchLimit(),
-          maxChars: collectorBodyMaxChars()
-        }
-      );
-      operations.push({
-        operation: "fetch_document_bodies",
-        scope: "global",
-        terms: bodySearchTerms.slice(0, 12),
-        candidates_preview: bodyFetchPreview(bodyCandidates, topicText),
-        result
-      });
-    } catch (error) {
-      errors.push(`fetch_document_bodies(global): ${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    const refreshed = await reloadGlobalResearchContext({
-      search: globalSearchTerm(params.sector) ?? (query === "Japan" ? undefined : query),
-      sector: params.sector,
-      since: params.since,
-      documentLimit: params.documentLimit
-    });
-    nextPayload.documents = mergeCompactDocuments(
-      nextPayload.documents,
-      [...(refreshed.documents as unknown as DocumentRecord[]), ...sectorFoundation.documents],
-      params.documentLimit
-    );
-    nextPayload.context = {
-      ...refreshed.context,
-      collector_focus: {
-        query,
-        data_requirements: dataRequirements,
-        thematic_queries: thematicQueries,
-        selected_companies: sectorFoundation.selectedCompanies.map((company) => compactCompanyForDiscovery(company)),
-        topic_excerpt: trimText(topicText, 900)
-      }
+  const collectorContext: CollectorToolContext = {
+    params,
+    topicText,
+    query,
+    dataRequirements,
+    thematicQueries,
+      dataRequests,
+      nextPayload,
+      collectedNewsDocuments: [],
+      companyDocuments: []
     };
+
+  const toolCalls = planCollectorToolCalls(collectorContext);
+  const toolResults: CollectorToolResult[] = [];
+  const operations: JsonRecord[] = [];
+  const errors: string[] = [];
+
+  for (const toolCall of toolCalls) {
+    const tool = collectorTools[toolCall.name];
+    const result = await executeCollectorTool(collectorContext, toolCall);
+    toolResults.push(result);
+    errors.push(...collectorResultErrors(result));
     operations.push({
-      operation: "reload_global_context",
-      documents: Array.isArray(nextPayload.documents) ? nextPayload.documents.length : 0,
-      macro_indicators: Array.isArray(asJsonRecord(nextPayload.context).macro_indicators) ? (asJsonRecord(nextPayload.context).macro_indicators as unknown[]).length : 0,
-      sector_snapshots: Array.isArray(asJsonRecord(nextPayload.context).sector_snapshots) ? (asJsonRecord(nextPayload.context).sector_snapshots as unknown[]).length : 0,
-      recent_events: Array.isArray(asJsonRecord(nextPayload.context).recent_events) ? (asJsonRecord(nextPayload.context).recent_events as unknown[]).length : 0
+      operation: toolCall.name,
+      tool_call_id: toolCall.id,
+      source: tool.source,
+      description: tool.description,
+      input: toolCall.input,
+      reason: toolCall.reason,
+      ok: result.ok,
+      duration_ms: result.duration_ms,
+      result: result.result,
+      error: result.error
     });
   }
 
@@ -1216,8 +1423,12 @@ async function runCollectorTurn(params: {
     ...(Array.isArray(params.basePayload.collector_history) ? params.basePayload.collector_history : []),
     {
       query,
+      data_requests: dataRequests,
       data_requirements: dataRequirements,
       thematic_queries: thematicQueries,
+      available_tools: collectorAvailableTools(),
+      tool_calls: toolCalls,
+      tool_results: toolResults,
       operations,
       errors,
       collected_at: new Date().toISOString()
@@ -1236,8 +1447,12 @@ async function runCollectorTurn(params: {
         ? "追加データ取得で一部失敗がありました。取得済みデータを反証工程で検証します。"
         : "追加データを取得・再読込しました。更新後の入力を反証工程に渡します。",
       query,
+      data_requests: dataRequests,
       data_requirements: dataRequirements,
       thematic_queries: thematicQueries,
+      available_tools: collectorAvailableTools(),
+      tool_calls: toolCalls,
+      tool_results: toolResults,
       operations,
       errors,
       data_collected: {
@@ -1386,8 +1601,23 @@ async function runHypothesisLoopOneTurnAtATime(params: {
       }
     }
     const durationMs = Date.now() - turnStartedAt;
-    const rerouteToCollector = shouldRerouteResearcherToCollector(agentName, agentOutput, agentRuns);
-    const effectiveAgentOutput: JsonRecord = rerouteToCollector
+    const globalCompanyMisread = params.hypothesisType === "global" && agentName !== "collector" && globalCompanyMissingBlocker(agentOutput);
+    const rerouteToCollector = !globalCompanyMisread && shouldRerouteResearcherToCollector(agentName, agentOutput, agentRuns);
+    const effectiveAgentOutput: JsonRecord = globalCompanyMisread
+      ? {
+          ...agentOutput,
+          next_action: "call_agent",
+          next_agent: agentName === "researcher" ? "hypothesis" : "researcher",
+          should_continue: true,
+          api_routing_override: {
+            from_next_action: agentOutput.next_action ?? null,
+            from_next_agent: agentOutput.next_agent ?? null,
+            reason: "Global hypothesis output treated missing company/ticker as a blocker. Global hypotheses should analyze sectors, company traits, and candidate groups without a preselected ticker."
+          },
+          reason_for_next_action:
+            "global仮説ではcompany/ticker未指定は正常です。対象企業なしを理由に判断不能にせず、有望セクター、マクロ伝播経路、企業特性、候補企業群の方向へ再整理します。"
+        }
+      : rerouteToCollector
       ? {
           ...agentOutput,
           next_action: "request_data",
@@ -1462,6 +1692,14 @@ async function runHypothesisLoopOneTurnAtATime(params: {
         llm_thinking_mode: "no_think",
         llm_recovery_instruction:
           "前回のLLM応答はJSON整形に失敗しました。次ターンではthinkを無効化し、JSONのみを短く返してください。"
+      };
+    }
+
+    if (globalCompanyMisread) {
+      workingPayload = {
+        ...workingPayload,
+        global_research_instruction:
+          "global仮説ではcompany/ticker未指定は正常です。対象企業なしを理由に判断不能にせず、有望セクター、マクロ伝播経路、注目企業特性、候補企業群・代表例、不足データを整理してください。候補企業群の整理はhypothesis/skeptic/researcherが行い、collectorには具体的な情報取得だけをdata_requestsで依頼してください。"
       };
     }
 
@@ -2026,7 +2264,9 @@ app.post(
     const sector = typeof hypothesisRecord.target_sector === "string" ? hypothesisRecord.target_sector : undefined;
     const lookbackDays = Number(req.body?.lookback_days ?? process.env.NEWS_LOOKBACK_DAYS ?? 450);
     const researchSince = daysAgoIso(lookbackDays);
+    const globalCompanyLimit = Number(req.body?.company_limit ?? process.env.GLOBAL_HYPOTHESIS_COMPANY_LIMIT ?? 90);
     let company: Awaited<ReturnType<typeof getCompany>> = undefined;
+    let companiesForGlobal: Company[] = [];
     let documents: DocumentRecord[] = [];
     let prices: Awaited<ReturnType<typeof getPrices>> = [];
     let globalContext: JsonRecord = {};
@@ -2035,19 +2275,27 @@ app.post(
       [company, documents, prices] = await Promise.all([getCompany(ticker), listDocuments({ ticker, limit: 80, since: researchSince }), getPrices(ticker)]);
     } else {
       const search = globalSearchTerm(sector);
-      const [targetedDocuments, broadDocuments, macroIndicators, macroNews, sectorSnapshots, events] = await Promise.all([
+      const [targetedDocuments, broadDocuments, macroIndicators, macroNews, sectorSnapshots, events, companies] = await Promise.all([
         listDocuments({ sourceType: "news", sector: search, search, limit: 140, since: researchSince }),
         listDocuments({ limit: 180, since: researchSince }),
         listMacroIndicators(16),
         listMacroNews(80),
         listSectorSnapshots(24),
-        listEvents()
+        listEvents(),
+        listCompanies(2000)
       ]);
+      companiesForGlobal = companyUniverseForGlobalHypothesis(companies, String(hypothesisRecord.title ?? ""), sector, globalCompanyLimit);
       documents = dedupeDocuments([...(targetedDocuments.length ? targetedDocuments : []), ...macroNews, ...broadDocuments]).slice(0, 120);
       globalContext = {
         mode: "global_sector_research",
         requested_sector: sector ?? null,
         effective_search: search ?? null,
+        company_universe_summary: {
+          sent: companiesForGlobal.length,
+          source: "listed_companies_db",
+          responsibility: "hypothesis_skeptic_researcher_select_candidate_groups",
+          note: "Collector does not select candidate companies; LLM agents use this universe to form company traits and representative groups."
+        },
         macro_indicators: macroIndicators,
         sector_snapshots: sectorSnapshots,
         recent_events: events.slice(0, 60).map((event) => compactEventForResearch(event as JsonRecord)),
@@ -2076,6 +2324,7 @@ app.post(
         hypothesis,
         hypothesis_type: hypothesisType,
         company: company ?? null,
+        companies: companiesForGlobal.map(compactCompanyForDiscovery),
         documents: documents.slice(0, documentSendLimit).map(compactDocumentForResearch),
         prices: prices.slice(-priceSendLimit),
         context: globalContext,
@@ -2088,6 +2337,7 @@ app.post(
           documents_sent: Math.min(documentSendLimit, documents.length),
           prices_available: prices.length,
           prices_sent: Math.min(priceSendLimit, prices.length),
+          companies_sent: companiesForGlobal.length,
           macro_indicators_sent: Array.isArray(globalContext.macro_indicators) ? globalContext.macro_indicators.length : 0,
           sector_snapshots_sent: Array.isArray(globalContext.sector_snapshots) ? globalContext.sector_snapshots.length : 0,
           recent_events_sent: Array.isArray(globalContext.recent_events) ? globalContext.recent_events.length : 0,
