@@ -170,10 +170,14 @@ function traceFromRuns(runs: AgentRunLike[]): LoopTraceItem[] {
       duration_ms: typeof output.duration_ms === "number" ? output.duration_ms : undefined,
       timeout_ms: typeof output.turn_timeout_ms === "number" ? output.turn_timeout_ms : undefined,
       summary:
-        typeof output.reason_for_next_action === "string"
+        typeof output.ui_summary === "string"
+          ? output.ui_summary
+          : typeof output.reason_for_next_action === "string"
           ? output.reason_for_next_action
           : typeof output.reason === "string"
             ? output.reason
+            : typeof output.handoff_text === "string"
+              ? output.handoff_text.slice(0, 240)
             : typeof output.status === "string" && output.status === "running"
               ? "この工程を実行中です。完了するとLLM raw logsとParsed outputが更新されます。"
               : undefined

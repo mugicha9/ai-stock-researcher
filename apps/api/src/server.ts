@@ -191,6 +191,359 @@ function compactDocumentForResearch(document: DocumentRecord): JsonRecord {
   };
 }
 
+type EvidenceSelectionMode = "discovery" | "verification";
+
+type EvidenceSelection = {
+  documents: JsonRecord[];
+  evidence_pack: JsonRecord;
+};
+
+type ScoredEvidenceDocument = {
+  record: JsonRecord;
+  key: string;
+  cluster: string;
+  score: number;
+  sourceScore: number;
+  relevance: number;
+  recencyScore: number;
+  importance: number;
+  lowQuality: boolean;
+  hasBody: boolean;
+  isPrimary: boolean;
+  isContradicting: boolean;
+  reason: string;
+};
+
+function evidenceTopicTerms(topicText: string): string[] {
+  const stopWords = new Set([
+    "global",
+    "company",
+    "hypothesis",
+    "metadata",
+    "only",
+    "collector",
+    "finalize",
+    "request",
+    "data",
+    "全体",
+    "有望",
+    "どんな",
+    "セクター",
+    "分野",
+    "市場",
+    "仮説",
+    "検証",
+    "反証",
+    "情報",
+    "取得",
+    "必要",
+    "不足",
+    "影響",
+    "企業",
+    "日本"
+  ]);
+  return uniqueLimited(
+    normalizeCollectorText(topicText)
+      .split(/\s+/)
+      .filter((term) => term.length >= 2 && term.length <= 24 && !stopWords.has(term.toLowerCase()) && !/^\d+$/.test(term)),
+    24
+  );
+}
+
+function evidenceDocumentRecord(value: unknown): JsonRecord | null {
+  const record = asJsonRecord(value);
+  const id = record.id;
+  const title = trimText(record.title, 260);
+  if (!title) return null;
+  const bodyExcerpt = trimText(record.body_excerpt ?? compactBodyExcerpt(record as DocumentRecord), 600);
+  return {
+    id,
+    ticker: record.ticker,
+    company_name: record.company_name,
+    source_type: record.source_type,
+    source_name: record.source_name,
+    title,
+    url: record.url,
+    published_at: record.published_at,
+    storage_level: record.storage_level,
+    retrieval_status: record.retrieval_status,
+    event_type: record.event_type,
+    sentiment: record.sentiment,
+    importance_score: record.importance_score,
+    summary_short: trimText(record.summary_short, 220),
+    summary_investment: trimText(record.summary_investment, 260),
+    summary_risk: trimText(record.summary_risk, 220),
+    key_points: Array.isArray(record.key_points) ? record.key_points.slice(0, 4).map((item) => trimText(item, 140)).filter(Boolean) : [],
+    body_excerpt: bodyExcerpt
+  };
+}
+
+function evidenceDocumentKey(record: JsonRecord): string {
+  return String(record.url ?? record.id ?? `${record.source_name ?? ""}:${record.title ?? ""}`).normalize("NFKC").toLowerCase();
+}
+
+function evidenceClusterKey(record: JsonRecord): string {
+  const title = normalizeCollectorText(String(record.title ?? ""))
+    .replace(/[0-9０-９年月日\s]+/g, "")
+    .slice(0, 42);
+  const source = String(record.source_name ?? record.source_type ?? "").slice(0, 24);
+  return `${source}:${title || evidenceDocumentKey(record).slice(0, 42)}`.toLowerCase();
+}
+
+function evidenceText(record: JsonRecord): string {
+  const keyPoints = Array.isArray(record.key_points) ? record.key_points.join(" ") : "";
+  return normalizeCollectorText(
+    [
+      record.title,
+      record.summary_short,
+      record.summary_investment,
+      record.summary_risk,
+      record.source_name,
+      record.source_type,
+      record.url,
+      keyPoints
+    ].join(" ")
+  ).toLowerCase();
+}
+
+function evidenceSourceScore(record: JsonRecord): number {
+  const text = evidenceText(record);
+  const sourceType = String(record.source_type ?? "").toLowerCase();
+  if (/disclosure|financial_statement|timely|tdnet|edinet/.test(sourceType)) return 100;
+  if (/jpx|tdnet|edinet|meti|boj|mof|cao|stat\.go|go\.jp|jquants|日銀|財務省|経済産業省|資源エネルギー庁|内閣府/.test(text)) return 90;
+  if (/official|policy|statistics|公的|統計|政策|国会|会議録/.test(text)) return 80;
+  if (/reuters|bloomberg|nikkei|日経|ロイター|ブルームバーグ|trusted_news/.test(text)) return 64;
+  if (/news|macro/.test(sourceType)) return 38;
+  return 28;
+}
+
+function evidenceLowQuality(record: JsonRecord): boolean {
+  const text = evidenceText(record);
+  return /ランキング|おすすめ|注目銘柄|成長株.{0,8}選|テンバガー|株価.{0,12}急騰|買い時|まとめ|一覧|知らないと損|seo/.test(text);
+}
+
+function evidenceContradicting(record: JsonRecord): boolean {
+  const text = evidenceText(record);
+  const sentiment = String(record.sentiment ?? "").toLowerCase();
+  return (
+    sentiment === "negative" ||
+    sentiment === "mixed" ||
+    /懸念|リスク|減益|下方|悪化|鈍化|低迷|競争激化|価格下落|コスト増|供給過剰|需要減|織り込み|割高|逆風/.test(text)
+  );
+}
+
+function evidenceRecencyScore(record: JsonRecord): number {
+  const timestamp = typeof record.published_at === "string" ? Date.parse(record.published_at) : NaN;
+  if (!Number.isFinite(timestamp)) return 0;
+  const ageDays = Math.max(0, (Date.now() - timestamp) / (24 * 60 * 60 * 1000));
+  if (ageDays <= 30) return 16;
+  if (ageDays <= 120) return 11;
+  if (ageDays <= 365) return 7;
+  if (ageDays <= 540) return 3;
+  return 0;
+}
+
+function evidenceRelevance(record: JsonRecord, terms: string[]): number {
+  if (!terms.length) return 0;
+  const text = evidenceText(record);
+  const title = normalizeCollectorText(String(record.title ?? "")).toLowerCase();
+  return terms.reduce((score, term) => {
+    const normalized = normalizeCollectorText(term).toLowerCase();
+    if (!normalized) return score;
+    return score + (title.includes(normalized) ? 3 : 0) + (text.includes(normalized) ? 1 : 0);
+  }, 0);
+}
+
+function evidenceReference(item: ScoredEvidenceDocument): JsonRecord {
+  return {
+    id: item.record.id,
+    title: trimText(item.record.title, 140),
+    source_name: item.record.source_name,
+    source_type: item.record.source_type,
+    published_at: item.record.published_at,
+    score: Math.round(item.score),
+    reason: item.reason
+  };
+}
+
+function evidenceRelevanceGate(item: ScoredEvidenceDocument, hasTopicTerms: boolean): boolean {
+  if (!hasTopicTerms) return true;
+  return item.relevance > 0 || item.importance >= 0.6 || item.hasBody;
+}
+
+function selectDiverseEvidence(items: ScoredEvidenceDocument[], limit: number, used = new Set<string>()): ScoredEvidenceDocument[] {
+  const selected: ScoredEvidenceDocument[] = [];
+  const clusterCounts = new Map<string, number>();
+  for (const item of items.sort((a, b) => b.score - a.score)) {
+    if (selected.length >= limit) break;
+    if (used.has(item.key)) continue;
+    const clusterCount = clusterCounts.get(item.cluster) ?? 0;
+    if (clusterCount >= 2) continue;
+    used.add(item.key);
+    clusterCounts.set(item.cluster, clusterCount + 1);
+    selected.push(item);
+  }
+  return selected;
+}
+
+function compactEvidenceDocument(item: ScoredEvidenceDocument, includeBody: boolean): JsonRecord {
+  const output: JsonRecord = {
+    ...item.record,
+    evidence_score: Math.round(item.score),
+    evidence_reason: item.reason
+  };
+  if (!includeBody) delete output["body_excerpt"];
+  return output;
+}
+
+function buildEvidenceSelection(
+  documents: unknown[],
+  options: {
+    mode: EvidenceSelectionMode;
+    topicText: string;
+    selectedLimit: number;
+    bodyLimit: number;
+  }
+): EvidenceSelection {
+  const terms = evidenceTopicTerms(options.topicText);
+  const seen = new Set<string>();
+  const records = documents
+    .map(evidenceDocumentRecord)
+    .filter((record): record is JsonRecord => Boolean(record))
+    .filter((record) => {
+      const key = evidenceDocumentKey(record);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+  const scored = records.map<ScoredEvidenceDocument>((record) => {
+    const sourceScore = evidenceSourceScore(record);
+    const relevance = evidenceRelevance(record, terms);
+    const recencyScore = evidenceRecencyScore(record);
+    const importance = numberValue(record.importance_score) ?? 0;
+    const lowQuality = evidenceLowQuality(record);
+    const isPrimary = sourceScore >= 80;
+    const isContradicting = evidenceContradicting(record);
+    const hasBody = Boolean(trimText(record.body_excerpt, 20));
+    const sourceContribution = terms.length && relevance === 0 ? Math.min(sourceScore, 16) : Math.min(sourceScore, 82);
+    const score =
+      sourceContribution +
+      relevance * (options.mode === "verification" ? 24 : 18) +
+      recencyScore +
+      importance * 18 +
+      (hasBody && options.mode === "verification" ? 8 : 0) -
+      (lowQuality ? 80 : 0);
+    const reason = isPrimary && relevance > 0
+      ? "primary_or_official_topic_match"
+      : isPrimary
+        ? "primary_or_official_context"
+      : isContradicting
+        ? "contradiction_or_risk_signal"
+        : relevance > 0
+          ? "topic_relevant_news"
+          : "diversity_or_recent_context";
+    return {
+      record,
+      key: evidenceDocumentKey(record),
+      cluster: evidenceClusterKey(record),
+      score,
+      sourceScore,
+      relevance,
+      recencyScore,
+      importance,
+      lowQuality,
+      hasBody,
+      isPrimary,
+      isContradicting,
+      reason
+    };
+  });
+
+  const eligible = scored.filter((item) => !item.lowQuality);
+  const used = new Set<string>();
+  const hasTopicTerms = terms.length > 0;
+  const primary = selectDiverseEvidence(
+    eligible.filter((item) => item.isPrimary && evidenceRelevanceGate(item, hasTopicTerms)),
+    options.mode === "discovery" ? 6 : 8,
+    used
+  );
+  const contradicting = selectDiverseEvidence(
+    eligible.filter((item) => item.isContradicting && evidenceRelevanceGate(item, hasTopicTerms)),
+    options.mode === "discovery" ? 4 : 8,
+    used
+  );
+  const supporting = selectDiverseEvidence(
+    eligible.filter((item) => !item.isPrimary && !item.isContradicting && evidenceRelevanceGate(item, hasTopicTerms)),
+    Math.max(0, options.selectedLimit - primary.length - contradicting.length),
+    used
+  );
+  const contextualPrimary = selectDiverseEvidence(
+    eligible.filter((item) => item.isPrimary && !used.has(item.key)),
+    Math.max(0, Math.min(options.mode === "discovery" ? 1 : 2, options.selectedLimit - primary.length - contradicting.length - supporting.length)),
+    used
+  );
+  const selected = [...primary, ...contradicting, ...supporting, ...contextualPrimary]
+    .sort((a, b) => b.score - a.score)
+    .slice(0, options.selectedLimit);
+  const selectedKeys = new Set(selected.map((item) => item.key));
+  const bodyKeys = new Set(
+    selected
+      .filter((item) => item.hasBody)
+      .sort((a, b) => b.relevance * 100 + b.sourceScore - (a.relevance * 100 + a.sourceScore))
+      .slice(0, options.bodyLimit)
+      .map((item) => item.key)
+  );
+  const missingBodyCandidates = selected
+    .filter((item) => !item.hasBody && typeof item.record.url === "string")
+    .slice(0, 10);
+
+  return {
+    documents: selected.map((item) => compactEvidenceDocument(item, bodyKeys.has(item.key))),
+    evidence_pack: {
+      mode: options.mode,
+      topic_terms: terms,
+      selection_summary: {
+        input_documents: records.length,
+        selected_documents: selected.length,
+        body_excerpt_included: bodyKeys.size,
+        low_quality_excluded: scored.filter((item) => item.lowQuality).length,
+        duplicate_or_invalid_excluded: documents.length - records.length,
+        selected_limit: options.selectedLimit,
+        body_limit: options.bodyLimit
+      },
+      selected_document_ids: selected.map((item) => item.record.id).filter(Boolean),
+      primary_sources: primary.filter((item) => selectedKeys.has(item.key)).map(evidenceReference),
+      supporting_news: supporting.filter((item) => selectedKeys.has(item.key)).slice(0, 12).map(evidenceReference),
+      contradicting_news: contradicting.filter((item) => selectedKeys.has(item.key)).map(evidenceReference),
+      missing_body_candidates: missingBodyCandidates.map(evidenceReference),
+      excluded_policy: {
+        low_quality_examples: scored.filter((item) => item.lowQuality).slice(0, 5).map(evidenceReference),
+        note: "Low-quality listicles/ranking-style articles are kept out of evidence and should only be used as weak leads."
+      }
+    }
+  };
+}
+
+function evidenceTopicFromPayload(payload: JsonRecord): string {
+  const hypothesis = asJsonRecord(payload.hypothesis);
+  const company = asJsonRecord(payload.company);
+  const context = asJsonRecord(payload.context);
+  const parts: string[] = [];
+  appendTextParts(parts, payload.focus);
+  appendTextParts(parts, payload.sector);
+  appendTextParts(parts, hypothesis.title);
+  appendTextParts(parts, hypothesis.summary);
+  appendTextParts(parts, hypothesis.target_sector);
+  appendTextParts(parts, hypothesis.growth_driver);
+  appendTextParts(parts, hypothesis.required_evidence);
+  appendTextParts(parts, hypothesis.risk_factors);
+  appendTextParts(parts, company.name ?? company.ticker);
+  appendTextParts(parts, company.sector ?? company.industry);
+  appendTextParts(parts, context.effective_search ?? context.requested_sector);
+  return parts.join(" ");
+}
+
 function compactEventForResearch(event: JsonRecord): JsonRecord {
   return {
     id: event.id,
@@ -205,6 +558,404 @@ function compactEventForResearch(event: JsonRecord): JsonRecord {
     impact_horizon: event.impact_horizon,
     published_at: event.published_at
   };
+}
+
+type LlmPromptPayloadMode = "discovery" | "agent";
+
+type LlmPromptBudget = {
+  mode: LlmPromptPayloadMode;
+  documentLimit: number;
+  bodyLimit: number;
+  evidenceReferenceLimit: number;
+  recentEventLimit: number;
+  companyLimit: number;
+  macroIndicatorLimit: number;
+  sectorSnapshotLimit: number;
+  priceLimit: number;
+  loopHistoryLimit: number;
+  collectorHistoryLimit: number;
+  existingHypothesisLimit: number;
+  agentMemoryLimit: number;
+  promptChars: number;
+  maxBytes: number;
+};
+
+function intEnv(name: string, fallback: number, min: number, max: number): number {
+  const parsed = Number(process.env[name]);
+  const value = Number.isFinite(parsed) ? Math.floor(parsed) : fallback;
+  return Math.max(min, Math.min(value, max));
+}
+
+function llmPromptBudget(mode: LlmPromptPayloadMode, hypothesisType?: string): LlmPromptBudget {
+  const isDiscovery = mode === "discovery";
+  const isCompany = hypothesisType === "company";
+  return {
+    mode,
+    documentLimit: intEnv(isDiscovery ? "LLM_DISCOVERY_DOCUMENT_LIMIT" : "LLM_AGENT_DOCUMENT_LIMIT", isDiscovery ? 14 : isCompany ? 16 : 14, 6, 40),
+    bodyLimit: intEnv(isDiscovery ? "LLM_DISCOVERY_BODY_LIMIT" : "LLM_AGENT_BODY_LIMIT", isDiscovery ? 1 : isCompany ? 3 : 2, 0, 8),
+    evidenceReferenceLimit: intEnv("LLM_EVIDENCE_REFERENCE_LIMIT", isDiscovery ? 8 : 10, 4, 24),
+    recentEventLimit: intEnv("LLM_RECENT_EVENT_LIMIT", isDiscovery ? 8 : 10, 0, 30),
+    companyLimit: intEnv(isDiscovery ? "LLM_DISCOVERY_COMPANY_LIMIT" : "LLM_AGENT_COMPANY_LIMIT", isDiscovery ? 24 : isCompany ? 0 : 16, 0, 60),
+    macroIndicatorLimit: intEnv("LLM_MACRO_INDICATOR_LIMIT", isDiscovery ? 8 : 8, 0, 20),
+    sectorSnapshotLimit: intEnv("LLM_SECTOR_SNAPSHOT_LIMIT", isDiscovery ? 8 : 10, 0, 24),
+    priceLimit: intEnv("LLM_PRICE_LIMIT", isCompany ? 60 : 0, 0, 120),
+    loopHistoryLimit: intEnv("LLM_LOOP_HISTORY_LIMIT", 6, 1, 12),
+    collectorHistoryLimit: intEnv("LLM_COLLECTOR_HISTORY_LIMIT", 2, 0, 5),
+    existingHypothesisLimit: intEnv("LLM_EXISTING_HYPOTHESIS_LIMIT", isDiscovery ? 16 : 6, 0, 40),
+    agentMemoryLimit: intEnv("LLM_AGENT_MEMORY_LIMIT", isDiscovery ? 4 : 0, 0, 12),
+    promptChars: intEnv(isDiscovery ? "LLM_DISCOVERY_PROMPT_CHARS" : "LLM_AGENT_PROMPT_CHARS", isDiscovery ? 12_000 : 11_000, 6_000, 18_000),
+    maxBytes: intEnv(isDiscovery ? "LLM_DISCOVERY_PAYLOAD_MAX_BYTES" : "LLM_AGENT_PAYLOAD_MAX_BYTES", isDiscovery ? 55_000 : 50_000, 20_000, 120_000)
+  };
+}
+
+function jsonByteLength(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value));
+}
+
+function asRecordArray(value: unknown): JsonRecord[] {
+  return Array.isArray(value) ? value.map(asJsonRecord).filter((item) => Object.keys(item).length > 0) : [];
+}
+
+function promptRecordText(record: JsonRecord, fields: string[]): string {
+  return normalizeCollectorText(fields.map((field) => record[field]).join(" ")).toLowerCase();
+}
+
+function promptTopicScore(record: JsonRecord, topicTerms: string[], fields: string[]): number {
+  if (!topicTerms.length) return 0;
+  const text = promptRecordText(record, fields);
+  return topicTerms.reduce((score, term) => {
+    const normalized = normalizeCollectorText(term).toLowerCase();
+    if (!normalized) return score;
+    return score + (text.includes(normalized) ? 1 : 0);
+  }, 0);
+}
+
+function publishedRecencyScore(value: unknown): number {
+  if (typeof value !== "string") return 0;
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return 0;
+  const ageDays = Math.max(0, (Date.now() - timestamp) / (24 * 60 * 60 * 1000));
+  if (ageDays <= 30) return 8;
+  if (ageDays <= 120) return 5;
+  if (ageDays <= 365) return 3;
+  return 0;
+}
+
+function selectPromptRecords(
+  value: unknown,
+  options: {
+    limit: number;
+    topicText: string;
+    scoreFields: string[];
+    compact: (record: JsonRecord) => JsonRecord;
+    extraScore?: (record: JsonRecord) => number;
+    key?: (record: JsonRecord) => string;
+  }
+): JsonRecord[] {
+  if (options.limit <= 0) return [];
+  const topicTerms = evidenceTopicTerms(options.topicText);
+  const seen = new Set<string>();
+  return asRecordArray(value)
+    .map((record, index) => {
+      const key = options.key?.(record) ?? String(record.id ?? record.url ?? record.title ?? index);
+      const score =
+        promptTopicScore(record, topicTerms, options.scoreFields) * 100 +
+        (options.extraScore?.(record) ?? 0) +
+        publishedRecencyScore(record.published_at);
+      return { record, index, key: key.normalize("NFKC").toLowerCase(), score };
+    })
+    .filter((item) => {
+      if (!item.key || seen.has(item.key)) return false;
+      seen.add(item.key);
+      return true;
+    })
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .slice(0, options.limit)
+    .map((item) => options.compact(item.record));
+}
+
+function compactEventForPrompt(record: JsonRecord): JsonRecord {
+  return {
+    id: record.id,
+    ticker: record.ticker,
+    company_name: record.company_name,
+    sector: record.sector,
+    event_type: record.event_type,
+    title: trimText(record.title, 160),
+    summary: trimText(record.summary, 240),
+    sentiment: record.sentiment,
+    impact_score: record.impact_score,
+    published_at: record.published_at
+  };
+}
+
+function eventPromptKey(record: JsonRecord): string {
+  const date = typeof record.published_at === "string" ? record.published_at.slice(0, 10) : "";
+  const title = normalizeCollectorText(String(record.title ?? "")).replace(/[0-9０-９年月日\s]+/g, "").slice(0, 80);
+  return [record.ticker, record.company_name, title, date].filter(Boolean).join(":");
+}
+
+function selectPromptEvents(events: unknown, topicText: string, limit: number): JsonRecord[] {
+  return selectPromptRecords(events, {
+    limit,
+    topicText,
+    scoreFields: ["ticker", "company_name", "sector", "event_type", "title", "summary"],
+    key: eventPromptKey,
+    extraScore: (record) => (numberValue(record.impact_score) ?? 0) * 12,
+    compact: compactEventForPrompt
+  });
+}
+
+function compactMacroIndicatorForPrompt(record: JsonRecord): JsonRecord {
+  return {
+    symbol: record.symbol,
+    label: record.label,
+    date: record.date,
+    close: record.close,
+    change_percent: record.change_percent,
+    source_name: record.source_name
+  };
+}
+
+function compactSectorSnapshotForPrompt(record: JsonRecord): JsonRecord {
+  return {
+    sector: record.sector,
+    company_count: record.company_count,
+    avg_revenue_growth: record.avg_revenue_growth,
+    avg_operating_profit_growth: record.avg_operating_profit_growth,
+    avg_operating_margin: record.avg_operating_margin,
+    avg_roe: record.avg_roe,
+    event_count: record.event_count,
+    avg_impact_score: record.avg_impact_score,
+    latest_event_at: record.latest_event_at
+  };
+}
+
+function compactCompanyForPrompt(record: JsonRecord): JsonRecord {
+  const metrics = asJsonRecord(record.latest_metrics);
+  return {
+    ticker: record.ticker,
+    name: record.name,
+    sector: record.sector,
+    industry: record.industry,
+    business_summary: trimText(record.business_summary ?? record.description, 180),
+    market_cap: record.market_cap,
+    latest_metrics: {
+      revenue_growth: metrics.revenue_growth,
+      operating_profit_growth: metrics.operating_profit_growth,
+      operating_margin: metrics.operating_margin,
+      roe: metrics.roe,
+      per: metrics.per,
+      pbr: metrics.pbr,
+      date: metrics.date
+    }
+  };
+}
+
+function companyPromptScore(record: JsonRecord): number {
+  const metrics = asJsonRecord(record.latest_metrics);
+  return (
+    (numberValue(metrics.operating_profit_growth) ?? 0) * 1.2 +
+    (numberValue(metrics.revenue_growth) ?? 0) +
+    (numberValue(metrics.operating_margin) ?? 0) * 0.2 +
+    (numberValue(metrics.roe) ?? 0) * 0.2
+  );
+}
+
+function compactEvidencePackForPrompt(pack: JsonRecord, budget: LlmPromptBudget): JsonRecord {
+  return {
+    mode: pack.mode,
+    topic_terms: Array.isArray(pack.topic_terms) ? pack.topic_terms.slice(0, 14) : [],
+    selection_summary: pack.selection_summary,
+    selected_document_ids: Array.isArray(pack.selected_document_ids) ? pack.selected_document_ids.slice(0, budget.documentLimit) : [],
+    primary_sources: asRecordArray(pack.primary_sources).slice(0, budget.evidenceReferenceLimit),
+    supporting_news: asRecordArray(pack.supporting_news).slice(0, budget.evidenceReferenceLimit),
+    contradicting_news: asRecordArray(pack.contradicting_news).slice(0, budget.evidenceReferenceLimit),
+    missing_body_candidates: asRecordArray(pack.missing_body_candidates).slice(0, Math.min(6, budget.evidenceReferenceLimit)),
+    excluded_policy: {
+      note: trimText(asJsonRecord(pack.excluded_policy).note, 220)
+    }
+  };
+}
+
+function compactCollectorHistoryForPrompt(value: unknown, limit: number): JsonRecord[] {
+  return asRecordArray(value)
+    .slice(-limit)
+    .map((history) => ({
+      query: trimText(history.query, 180),
+      data_requirements: compactTextList(history.data_requirements, 5),
+      thematic_queries: compactRecordList(history.thematic_queries, 5, ["query", "reason"]),
+      operations: compactRecordList(history.operations, 10, ["operation", "source", "input", "reason", "ok", "duration_ms", "error"]),
+      errors: compactTextList(history.errors, 6),
+      collected_at: history.collected_at
+    }));
+}
+
+function compactPromptContext(context: JsonRecord, topicText: string, budget: LlmPromptBudget): JsonRecord {
+  return {
+    mode: context.mode,
+    requested_sector: context.requested_sector,
+    effective_search: context.effective_search,
+    evidence_selection: context.evidence_selection,
+    company_universe_summary: context.company_universe_summary,
+    collector_focus: context.collector_focus
+      ? {
+          query: trimText(asJsonRecord(context.collector_focus).query, 180),
+          data_requirements: compactTextList(asJsonRecord(context.collector_focus).data_requirements, 6),
+          data_requests: compactRecordList(asJsonRecord(context.collector_focus).data_requests, 6, ["query", "source", "reason", "priority", "ticker"]),
+          thematic_queries: compactRecordList(asJsonRecord(context.collector_focus).thematic_queries, 5, ["query", "reason"])
+        }
+      : undefined,
+    macro_indicators: selectPromptRecords(context.macro_indicators, {
+      limit: budget.macroIndicatorLimit,
+      topicText,
+      scoreFields: ["symbol", "label", "source_name"],
+      compact: compactMacroIndicatorForPrompt
+    }),
+    sector_snapshots: selectPromptRecords(context.sector_snapshots, {
+      limit: budget.sectorSnapshotLimit,
+      topicText,
+      scoreFields: ["sector"],
+      extraScore: (record) => (numberValue(record.avg_impact_score) ?? 0) * 10 + (numberValue(record.event_count) ?? 0) * 0.2,
+      compact: compactSectorSnapshotForPrompt
+    }),
+    recent_events: selectPromptEvents(context.recent_events, topicText, budget.recentEventLimit),
+    data_warnings: Array.isArray(context.data_warnings) ? context.data_warnings.slice(0, 8) : [],
+    compaction_counts: {
+      macro_indicators_available: Array.isArray(context.macro_indicators) ? context.macro_indicators.length : 0,
+      sector_snapshots_available: Array.isArray(context.sector_snapshots) ? context.sector_snapshots.length : 0,
+      recent_events_available: Array.isArray(context.recent_events) ? context.recent_events.length : 0
+    }
+  };
+}
+
+function compactAgentHandoffForPrompt(value: unknown, limit: number): JsonRecord {
+  const handoff = asJsonRecord(value);
+  const history = asRecordArray(handoff.loop_history).slice(-limit).map(loopOutputExcerpt);
+  const previous = history.at(-1) ?? null;
+  return {
+    to_agent: handoff.to_agent,
+    from_agent: handoff.from_agent ?? previous?.agent_name ?? null,
+    previous_output: previous,
+    loop_history: history,
+    instruction: handoff.instruction
+  };
+}
+
+function enforcePromptByteBudget(payload: JsonRecord, budget: LlmPromptBudget): JsonRecord {
+  const output: JsonRecord = { ...payload };
+  for (let pass = 0; pass < 8 && jsonByteLength(output) > budget.maxBytes; pass += 1) {
+    const context = asJsonRecord(output.context);
+    const documents = Array.isArray(output.documents) ? output.documents : [];
+    const events = Array.isArray(context.recent_events) ? context.recent_events : [];
+    const companies = Array.isArray(output.companies) ? output.companies : [];
+    const sectorSnapshots = Array.isArray(context.sector_snapshots) ? context.sector_snapshots : [];
+    const macroIndicators = Array.isArray(context.macro_indicators) ? context.macro_indicators : [];
+    if (documents.length > 6) {
+      output.documents = documents.slice(0, Math.max(6, Math.ceil(documents.length * 0.7)));
+    } else if (events.length > 4) {
+      output.context = { ...context, recent_events: events.slice(0, Math.max(4, Math.ceil(events.length * 0.7))) };
+    } else if (companies.length > 6) {
+      output.companies = companies.slice(0, Math.max(6, Math.ceil(companies.length * 0.7)));
+    } else if (sectorSnapshots.length > 4) {
+      output.context = { ...context, sector_snapshots: sectorSnapshots.slice(0, Math.max(4, Math.ceil(sectorSnapshots.length * 0.7))) };
+    } else if (macroIndicators.length > 4) {
+      output.context = { ...context, macro_indicators: macroIndicators.slice(0, Math.max(4, Math.ceil(macroIndicators.length * 0.7))) };
+    } else {
+      break;
+    }
+  }
+  return output;
+}
+
+function preparePayloadForLlmPrompt(
+  payload: JsonRecord,
+  options: { mode: LlmPromptPayloadMode; agentName?: AgentName; hypothesisType?: string; topicText?: string }
+): JsonRecord {
+  const budget = llmPromptBudget(options.mode, options.hypothesisType);
+  const topicText = options.topicText ?? evidenceTopicFromPayload(payload);
+  const evidence = buildEvidenceSelection(Array.isArray(payload.documents) ? payload.documents : [], {
+    mode: options.mode === "discovery" ? "discovery" : "verification",
+    topicText,
+    selectedLimit: budget.documentLimit,
+    bodyLimit: budget.bodyLimit
+  });
+  const compacted: JsonRecord = {
+    ...payload,
+    documents: evidence.documents,
+    evidence_pack: compactEvidencePackForPrompt(asJsonRecord(evidence.evidence_pack), budget),
+    context: {
+      ...compactPromptContext(asJsonRecord(payload.context), topicText, budget),
+      evidence_selection: asJsonRecord(evidence.evidence_pack).selection_summary
+    },
+    companies: selectPromptRecords(payload.companies, {
+      limit: budget.companyLimit,
+      topicText,
+      scoreFields: ["ticker", "name", "sector", "industry", "business_summary", "description"],
+      extraScore: companyPromptScore,
+      compact: compactCompanyForPrompt,
+      key: (record) => String(record.ticker ?? record.name ?? "")
+    }),
+    prices: Array.isArray(payload.prices) ? payload.prices.slice(-budget.priceLimit) : [],
+    existing_hypotheses: compactRecordList(payload.existing_hypotheses, budget.existingHypothesisLimit, [
+      "id",
+      "hypothesis_type",
+      "title",
+      "summary",
+      "status",
+      "growth_driver",
+      "final_decision",
+      "score_overall"
+    ]),
+    agent_memory: asRecordArray(payload.agent_memory).slice(0, budget.agentMemoryLimit),
+    collector_history: compactCollectorHistoryForPrompt(payload.collector_history, budget.collectorHistoryLimit),
+    loop_history: asRecordArray(payload.loop_history).slice(-budget.loopHistoryLimit).map(loopOutputExcerpt),
+    agent_handoff: compactAgentHandoffForPrompt(payload.agent_handoff, budget.loopHistoryLimit),
+    llm_prompt_budget_chars: budget.promptChars,
+    llm_output_max_tokens:
+      payload.llm_output_max_tokens ??
+      (options.mode === "discovery"
+        ? Math.max(1100, Math.min(1900, 900 + (numberValue(payload.limit) ?? 3) * 300))
+        : options.agentName === "researcher"
+          ? 1400
+          : 1050),
+    llm_input_budget: {
+      mode: budget.mode,
+      max_bytes: budget.maxBytes,
+      documents_limit: budget.documentLimit,
+      body_limit: budget.bodyLimit,
+      recent_event_limit: budget.recentEventLimit,
+      company_limit: budget.companyLimit,
+      macro_indicator_limit: budget.macroIndicatorLimit,
+      sector_snapshot_limit: budget.sectorSnapshotLimit,
+      original_counts: {
+        documents: Array.isArray(payload.documents) ? payload.documents.length : 0,
+        companies: Array.isArray(payload.companies) ? payload.companies.length : 0,
+        prices: Array.isArray(payload.prices) ? payload.prices.length : 0,
+        macro_indicators: Array.isArray(asJsonRecord(payload.context).macro_indicators) ? (asJsonRecord(payload.context).macro_indicators as unknown[]).length : 0,
+        sector_snapshots: Array.isArray(asJsonRecord(payload.context).sector_snapshots) ? (asJsonRecord(payload.context).sector_snapshots as unknown[]).length : 0,
+        recent_events: Array.isArray(asJsonRecord(payload.context).recent_events) ? (asJsonRecord(payload.context).recent_events as unknown[]).length : 0
+      }
+    }
+  };
+  const fitted = enforcePromptByteBudget(compacted, budget);
+  fitted.llm_input_budget = {
+    ...asJsonRecord(fitted.llm_input_budget),
+    final_bytes: jsonByteLength(fitted),
+    final_counts: {
+      documents: Array.isArray(fitted.documents) ? fitted.documents.length : 0,
+      companies: Array.isArray(fitted.companies) ? fitted.companies.length : 0,
+      prices: Array.isArray(fitted.prices) ? fitted.prices.length : 0,
+      macro_indicators: Array.isArray(asJsonRecord(fitted.context).macro_indicators) ? (asJsonRecord(fitted.context).macro_indicators as unknown[]).length : 0,
+      sector_snapshots: Array.isArray(asJsonRecord(fitted.context).sector_snapshots) ? (asJsonRecord(fitted.context).sector_snapshots as unknown[]).length : 0,
+      recent_events: Array.isArray(asJsonRecord(fitted.context).recent_events) ? (asJsonRecord(fitted.context).recent_events as unknown[]).length : 0
+    }
+  };
+  fitted.input_summary = {
+    ...asJsonRecord(payload.input_summary),
+    llm_input_budget: fitted.llm_input_budget
+  };
+  return fitted;
 }
 
 function dedupeDocuments(documents: DocumentRecord[]): DocumentRecord[] {
@@ -348,10 +1099,12 @@ function companyUniverseForGlobalHypothesis(companies: Company[], focus?: string
 
 function discoveryContextSummary(payload: JsonRecord): JsonRecord {
   const context = asJsonRecord(payload.context);
+  const evidencePack = asJsonRecord(payload.evidence_pack);
   return {
     focus: payload.focus,
     sector: payload.sector,
     documents_sent: Array.isArray(payload.documents) ? payload.documents.length : 0,
+    evidence_selection: asJsonRecord(evidencePack.selection_summary),
     companies_sent: Array.isArray(payload.companies) ? payload.companies.length : 0,
     existing_hypotheses_sent: Array.isArray(payload.existing_hypotheses) ? payload.existing_hypotheses.length : 0,
     agent_memory_sent: Array.isArray(payload.agent_memory) ? payload.agent_memory.length : 0,
@@ -465,7 +1218,9 @@ function loopOutputExcerpt(output: JsonRecord): JsonRecord {
     next_agent: output.next_agent,
     should_continue: output.should_continue,
     final_decision: output.final_decision,
-    reason: trimText(output.reason ?? output.reason_for_next_action, 400),
+    ui_summary: trimText(output.ui_summary, 220),
+    reason: trimText(output.reason ?? output.reason_for_next_action ?? output.ui_summary, 400),
+    handoff_text: trimText(output.handoff_text, 1200),
     claims: compactRecordList(output.claims, 5, ["claim", "evidence_ids", "confidence"]),
     questions: compactRecordList(output.questions, 5, ["question", "priority", "target_agent"]),
     global_analysis: Object.keys(asJsonRecord(output.global_analysis)).length ? asJsonRecord(output.global_analysis) : undefined,
@@ -474,7 +1229,7 @@ function loopOutputExcerpt(output: JsonRecord): JsonRecord {
     recommended_next_research: compactTextList(output.recommended_next_research, 6),
     scores: Object.keys(asJsonRecord(output.scores)).length ? asJsonRecord(output.scores) : undefined,
     final_report: trimText(output.final_report, 600),
-    llm_parse_failed: Boolean(output.llm_parse_failed || output.llm_parse_warning || output.raw_model_output || output.llm_fallback)
+    llm_parse_failed: Boolean(output.llm_parse_failed || output.llm_parse_warning || output.llm_control_parse_warning || output.raw_model_output || output.llm_fallback)
   };
 }
 
@@ -487,7 +1242,7 @@ function buildAgentHandoff(agentName: AgentName, agentRuns: JsonRecord[]): JsonR
     previous_output: previous,
     loop_history: loopHistory,
     instruction: previous
-      ? "前工程のclaims/questions/missing_information/recommended_next_researchを引き継ぎ、重複を避けて次の工程を実行する。"
+      ? "前工程のhandoff_text/ui_summary/data_requests/missing_information/recommended_next_researchを引き継ぎ、重複を避けて次の工程を実行する。"
       : "初回ターンのため前工程出力はありません。"
   };
 }
@@ -548,6 +1303,8 @@ function collectorTextCorpus(basePayload: JsonRecord, previousOutput: JsonRecord
   appendTextParts(parts, previousOutput?.data_requests);
   appendTextParts(parts, previousOutput?.tool_calls);
   appendTextParts(parts, previousOutput?.claims);
+  appendTextParts(parts, previousOutput?.ui_summary);
+  appendTextParts(parts, previousOutput?.handoff_text);
   appendTextParts(parts, previousOutput?.reason);
   appendTextParts(parts, previousOutput?.reason_for_next_action);
   appendTextParts(parts, previousOutput?.final_report);
@@ -1259,6 +2016,8 @@ function outputTextForRouting(output: JsonRecord): string {
     [
       output.reason,
       output.reason_for_next_action,
+      output.ui_summary,
+      output.handoff_text,
       output.final_report,
       output.missing_information,
       output.recommended_next_research,
@@ -1300,7 +2059,7 @@ function shouldRerouteResearcherToCollector(agentName: AgentName, output: JsonRe
 }
 
 function hasLlmParseFailure(output: JsonRecord): boolean {
-  return Boolean(output.llm_parse_failed || output.llm_parse_warning || output.raw_model_output || output.llm_fallback);
+  return Boolean(output.llm_parse_failed || output.llm_parse_warning || output.llm_control_parse_warning || output.raw_model_output || output.llm_fallback);
 }
 
 function selectNextAgent(agentName: AgentName, output: JsonRecord): AgentName {
@@ -1313,7 +2072,7 @@ function selectNextAgent(agentName: AgentName, output: JsonRecord): AgentName {
 }
 
 function loopSummary(output: JsonRecord): string | undefined {
-  return trimText(output.reason ?? output.reason_for_next_action ?? output.final_report, 500) ?? undefined;
+  return trimText(output.ui_summary ?? output.reason ?? output.reason_for_next_action ?? output.final_report ?? output.handoff_text, 500) ?? undefined;
 }
 
 function routingContext(agentName: AgentName, agentRuns: JsonRecord[]): JsonRecord {
@@ -1505,7 +2264,7 @@ async function runHypothesisLoopOneTurnAtATime(params: {
     const agentName = currentAgent;
     const agentHandoff = buildAgentHandoff(agentName, agentRuns);
     const loopHistory = Array.isArray(agentHandoff.loop_history) ? agentHandoff.loop_history : [];
-    const turnPayload: JsonRecord = {
+    const richTurnPayload: JsonRecord = {
       ...workingPayload,
       loop_turn: turn,
       loop_history: loopHistory,
@@ -1514,6 +2273,11 @@ async function runHypothesisLoopOneTurnAtATime(params: {
       loop_instruction: HYPOTHESIS_LOOP_INSTRUCTION,
       turn_timeout_ms: config.researchTimeoutMs
     };
+    const turnPayload = preparePayloadForLlmPrompt(richTurnPayload, {
+      mode: "agent",
+      agentName,
+      hypothesisType: params.hypothesisType
+    });
     const inputSummary = buildTurnInputLog(agentName, turnPayload);
     const turnStartedAt = Date.now();
     const startedRun = await saveAgentRun({
@@ -2077,9 +2841,16 @@ app.post(
     const input = hypothesisDiscoverySchema.parse(req.body ?? {});
     const focus = input.focus?.trim() || undefined;
     const sector = input.sector?.trim() || undefined;
-    const limit = input.limit ?? 6;
+    const requestedLimit = input.limit ?? 3;
+    const configuredPromoteLimit = Number(process.env.DISCOVERY_HYPOTHESIS_PROMOTE_LIMIT ?? 3);
+    const promoteCap = Number.isFinite(configuredPromoteLimit) ? configuredPromoteLimit : 3;
+    const promoteLimit = Math.max(1, Math.min(requestedLimit, promoteCap));
     const documentLimit = input.document_limit ?? 90;
-    const companyLimit = input.company_limit ?? 90;
+    const configuredEvidenceLimit = Number(process.env.DISCOVERY_EVIDENCE_LIMIT ?? 24);
+    const evidenceCap = Number.isFinite(configuredEvidenceLimit) ? configuredEvidenceLimit : 24;
+    const evidenceLimit = Math.max(8, Math.min(documentLimit, evidenceCap));
+    const configuredCompanyLimit = input.company_limit ?? Number(process.env.DISCOVERY_COMPANY_LIMIT ?? 60);
+    const companyLimit = Math.max(30, Math.min(Number.isFinite(configuredCompanyLimit) ? Math.floor(configuredCompanyLimit) : 60, 220));
     const lookbackDays = input.lookback_days ?? Number(process.env.NEWS_LOOKBACK_DAYS ?? 450);
     const since = daysAgoIso(lookbackDays);
     const query = discoveryNewsQuery({ focus, sector });
@@ -2131,19 +2902,38 @@ app.post(
       .sort((a, b) => companyDiscoveryScore(b, focus, sector) - companyDiscoveryScore(a, focus, sector))
       .slice(0, companyLimit)
       .map(compactCompanyForDiscovery);
+    const discoveryEvidence = buildEvidenceSelection(globalResearch.documents, {
+      mode: "discovery",
+      topicText: [focus, sector, query].filter(Boolean).join(" "),
+      selectedLimit: evidenceLimit,
+      bodyLimit: Number.isFinite(Number(process.env.DISCOVERY_BODY_EVIDENCE_LIMIT))
+        ? Number(process.env.DISCOVERY_BODY_EVIDENCE_LIMIT)
+        : 0
+    });
     const payload: JsonRecord = {
       task: "discover_underappreciated_growth_hypotheses",
       focus: focus ?? null,
       sector: sector ?? null,
-      limit,
+      limit: promoteLimit,
+      requested_signal_limit: requestedLimit,
       lookback_days: lookbackDays,
       collector_operations: operations,
       collector_errors: errors,
-      documents: globalResearch.documents,
-      context: globalResearch.context,
+      documents: discoveryEvidence.documents,
+      evidence_pack: discoveryEvidence.evidence_pack,
+      context: {
+        ...globalResearch.context,
+        evidence_selection: asJsonRecord(discoveryEvidence.evidence_pack).selection_summary
+      },
       companies: companiesForDiscovery,
-      existing_hypotheses: existingHypotheses.slice(0, 80).map((hypothesis) => compactHypothesisForResearch(hypothesis as JsonRecord)),
+      existing_hypotheses: existingHypotheses.slice(0, 40).map((hypothesis) => compactHypothesisForResearch(hypothesis as JsonRecord)),
       agent_memory: agentMemory,
+      hypothesis_creation_policy: {
+        max_created_hypotheses: promoteLimit,
+        requested_signal_limit: requestedLimit,
+        do_not_split_minor_variants: true,
+        use_backlog_signals_for_non_promoted_ideas: true
+      },
       source_quality_policy: {
         primary_sources_first: ["timely_disclosure", "financial_statement", "company_profile", "official_statistics", "policy_document"],
         weak_leads_only: ["ranking_article", "listicle", "seo_growth_stock_article", "headline_only_news"],
@@ -2159,16 +2949,23 @@ app.post(
         focus,
         sector,
         query,
-        documents_sent: globalResearch.documents.length,
+        documents_available: globalResearch.documents.length,
+        documents_sent: discoveryEvidence.documents.length,
+        evidence_selection: asJsonRecord(discoveryEvidence.evidence_pack).selection_summary,
         companies_sent: companiesForDiscovery.length,
-        existing_hypotheses_sent: Math.min(80, existingHypotheses.length),
+        existing_hypotheses_sent: Math.min(40, existingHypotheses.length),
         agent_memory_sent: agentMemory.length,
         news_since: since
       }
     };
+    const llmPayload = preparePayloadForLlmPrompt(payload, {
+      mode: "discovery",
+      hypothesisType: "global",
+      topicText: [focus, sector, query].filter(Boolean).join(" ")
+    });
 
-    const output = await researchPost<JsonRecord>("/hypotheses/discover", payload, requestContext(req, res));
-    const candidateRecords = Array.isArray(output.hypotheses) ? output.hypotheses.map(asJsonRecord).slice(0, limit) : [];
+    const output = await researchPost<JsonRecord>("/hypotheses/discover", llmPayload, requestContext(req, res));
+    const candidateRecords = Array.isArray(output.hypotheses) ? output.hypotheses.map(asJsonRecord).slice(0, promoteLimit) : [];
     const created: Hypothesis[] = [];
     const skipped: JsonRecord[] = [];
 
@@ -2212,7 +3009,7 @@ app.post(
         await saveAgentRun({
           hypothesis_id: hypothesis.id,
           agent_name: "discovery",
-          input: discoveryContextSummary(payload),
+          input: discoveryContextSummary(llmPayload),
           output: {
             agent_name: "discovery",
             next_action: "create_hypothesis",
@@ -2230,7 +3027,7 @@ app.post(
       skipped,
       collector_operations: operations,
       collector_errors: errors,
-      context_summary: discoveryContextSummary(payload)
+      context_summary: discoveryContextSummary(llmPayload)
     });
   })
 );
@@ -2264,7 +3061,7 @@ app.post(
     const sector = typeof hypothesisRecord.target_sector === "string" ? hypothesisRecord.target_sector : undefined;
     const lookbackDays = Number(req.body?.lookback_days ?? process.env.NEWS_LOOKBACK_DAYS ?? 450);
     const researchSince = daysAgoIso(lookbackDays);
-    const globalCompanyLimit = Number(req.body?.company_limit ?? process.env.GLOBAL_HYPOTHESIS_COMPANY_LIMIT ?? 90);
+    const globalCompanyLimit = Number(req.body?.company_limit ?? process.env.GLOBAL_HYPOTHESIS_COMPANY_LIMIT ?? 60);
     let company: Awaited<ReturnType<typeof getCompany>> = undefined;
     let companiesForGlobal: Company[] = [];
     let documents: DocumentRecord[] = [];
@@ -2306,7 +3103,23 @@ app.post(
         ].filter(Boolean)
       };
     }
-    const documentSendLimit = hypothesisType === "company" ? 36 : 96;
+    const requestedDocumentLimit = Number(req.body?.document_limit);
+    const defaultDocumentSendLimit = hypothesisType === "company" ? 24 : 32;
+    const documentSendLimit = Math.max(
+      8,
+      Math.min(Number.isFinite(requestedDocumentLimit) ? Math.floor(requestedDocumentLimit) : defaultDocumentSendLimit, 80)
+    );
+    const evidenceSelection = buildEvidenceSelection(documents, {
+      mode: "verification",
+      topicText: evidenceTopicFromPayload({
+        hypothesis,
+        hypothesis_type: hypothesisType,
+        company: company ?? null,
+        context: globalContext
+      }),
+      selectedLimit: documentSendLimit,
+      bodyLimit: Number.isFinite(Number(req.body?.body_limit)) ? Number(req.body?.body_limit) : hypothesisType === "company" ? 4 : 5
+    });
     const priceSendLimit = 90;
 
     const output = await runHypothesisLoopOneTurnAtATime({
@@ -2325,16 +3138,21 @@ app.post(
         hypothesis_type: hypothesisType,
         company: company ?? null,
         companies: companiesForGlobal.map(compactCompanyForDiscovery),
-        documents: documents.slice(0, documentSendLimit).map(compactDocumentForResearch),
+        documents: evidenceSelection.documents,
+        evidence_pack: evidenceSelection.evidence_pack,
         prices: prices.slice(-priceSendLimit),
-        context: globalContext,
+        context: {
+          ...globalContext,
+          evidence_selection: asJsonRecord(evidenceSelection.evidence_pack).selection_summary
+        },
         llm_thinking_mode: req.body?.llm_thinking_mode ?? "auto",
         input_summary: {
           mode: hypothesisType === "company" ? "company_hypothesis" : "global_hypothesis",
           sector,
           ticker,
           documents_available: documents.length,
-          documents_sent: Math.min(documentSendLimit, documents.length),
+          documents_sent: evidenceSelection.documents.length,
+          evidence_selection: asJsonRecord(evidenceSelection.evidence_pack).selection_summary,
           prices_available: prices.length,
           prices_sent: Math.min(priceSendLimit, prices.length),
           companies_sent: companiesForGlobal.length,

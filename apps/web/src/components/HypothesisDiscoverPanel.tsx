@@ -52,7 +52,7 @@ export function HypothesisDiscoverPanel() {
   const router = useRouter();
   const [focus, setFocus] = useState("");
   const [sector, setSector] = useState("");
-  const [limit, setLimit] = useState("6");
+  const [limit, setLimit] = useState("3");
   const [lookbackDays, setLookbackDays] = useState("450");
   const [refresh, setRefresh] = useState(true);
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("auto");
@@ -70,7 +70,7 @@ export function HypothesisDiscoverPanel() {
         body: JSON.stringify({
           focus: focus.trim() || undefined,
           sector: sector.trim() || undefined,
-          limit: Number(limit) || 6,
+          limit: Number(limit) || 3,
           lookback_days: Number(lookbackDays) || 450,
           refresh,
           create: true,

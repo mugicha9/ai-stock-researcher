@@ -46,6 +46,7 @@ services:
   llama:
     image: ghcr.io/ggml-org/llama.cpp:server-cuda
     profiles: ["gpu"]
+    restart: unless-stopped
     gpus: all
     environment:
       NVIDIA_VISIBLE_DEVICES: all
@@ -78,7 +79,7 @@ services:
       LLAMA_BASE_URLS: ${LLAMA_BASE_URLS:-http://llama:8080/v1,http://host.docker.internal:8080/v1}
       LLAMA_MODEL_NAME: ${LLAMA_MODEL_NAME:-local-gguf}
       LLAMA_REQUEST_TIMEOUT: ${LLAMA_REQUEST_TIMEOUT:-900}
-      LLAMA_CONNECT_TIMEOUT: ${LLAMA_CONNECT_TIMEOUT:-20}
+      LLAMA_CONNECT_TIMEOUT: ${LLAMA_CONNECT_TIMEOUT:-5}
       LLM_THINKING_MODE: ${LLM_THINKING_MODE:-auto}
       LLM_AUTO_THINKING_FOR_JSON: ${LLM_AUTO_THINKING_FOR_JSON:-false}
       LLM_RESPONSE_FORMAT_JSON: ${LLM_RESPONSE_FORMAT_JSON:-true}

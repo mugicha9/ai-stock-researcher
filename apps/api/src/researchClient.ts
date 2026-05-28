@@ -42,11 +42,17 @@ class ResearchTransportTimeoutError extends Error {
 }
 
 function payloadStats(payload: JsonRecord) {
+  const context = payload.context && typeof payload.context === "object" && !Array.isArray(payload.context) ? (payload.context as JsonRecord) : {};
   return {
     bytes: Buffer.byteLength(JSON.stringify(payload)),
     documents: Array.isArray(payload.documents) ? payload.documents.length : undefined,
     hypotheses: Array.isArray(payload.hypotheses) ? payload.hypotheses.length : undefined,
-    prices: Array.isArray(payload.prices) ? payload.prices.length : undefined
+    companies: Array.isArray(payload.companies) ? payload.companies.length : undefined,
+    prices: Array.isArray(payload.prices) ? payload.prices.length : undefined,
+    macro_indicators: Array.isArray(context.macro_indicators) ? context.macro_indicators.length : undefined,
+    sector_snapshots: Array.isArray(context.sector_snapshots) ? context.sector_snapshots.length : undefined,
+    recent_events: Array.isArray(context.recent_events) ? context.recent_events.length : undefined,
+    llm_input_budget: payload.llm_input_budget
   };
 }
 
@@ -199,7 +205,26 @@ export async function researchPost<T extends JsonRecord = JsonRecord>(
       },
       "research request completed"
     );
-    return JSON.parse(response.text) as T;
+    try {
+      return JSON.parse(response.text) as T;
+    } catch (error) {
+      logger.error(
+        {
+          request_id: options.requestId,
+          route: options.route,
+          research_path: path,
+          status: response.status,
+          duration_ms: Date.now() - startedAt,
+          response_excerpt: response.text.slice(0, 2000),
+          error: serializeError(error)
+        },
+        "research response invalid json"
+      );
+      throw new ResearchError("Research backend returned invalid JSON", 502, {
+        response_excerpt: response.text.slice(0, 2000),
+        parse_error: serializeError(error)
+      });
+    }
   } catch (error) {
     if (error instanceof ResearchError) throw error;
     logger.error(

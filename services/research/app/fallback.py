@@ -48,6 +48,11 @@ def agent_response(agent_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         ],
         "next_action": next_action,
         "next_agent": next_agent,
+        "ui_summary": "LLM接続が利用できないため、保守的な暫定出力を返しています。",
+        "handoff_text": (
+            f"{title} は追加の一次情報確認に値するが、現時点では暫定評価に留まる。"
+            "受注・利益率・株価反応・競合比較を確認し、次工程で根拠と反証を分けて検証する。"
+        ),
         "reason_for_next_action": "LLM接続が利用できないため、保守的な暫定出力を返しています。",
         "should_continue": True,
     }
