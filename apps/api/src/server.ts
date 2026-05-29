@@ -89,12 +89,46 @@ function currentRequestId(req: Request, res: Response): string {
   return req.header("x-request-id") ?? "";
 }
 
-function requestContext(req: Request, res: Response): { requestId: string; route: string } {
+type ApiRequestContext = { requestId: string; route: string; signal: AbortSignal };
+
+function clientAbortError(message = "Client request aborted"): Error & { code?: string } {
+  const error = new Error(message) as Error & { code?: string };
+  error.name = "AbortError";
+  error.code = "ABORT_ERR";
+  return error;
+}
+
+function requestAbortSignal(req: Request, res: Response): AbortSignal {
+  const locals = res.locals as typeof res.locals & {
+    abortController?: AbortController;
+    abortListenersAttached?: boolean;
+  };
+  if (!locals.abortController) locals.abortController = new AbortController();
+  if (!locals.abortListenersAttached) {
+    const abort = () => {
+      if (!res.writableEnded && !locals.abortController?.signal.aborted) {
+        locals.abortController?.abort(clientAbortError());
+      }
+    };
+    req.on("aborted", abort);
+    res.on("close", abort);
+    locals.abortListenersAttached = true;
+  }
+  return locals.abortController.signal;
+}
+
+function requestContext(req: Request, res: Response): ApiRequestContext {
   const routePath = typeof req.route?.path === "string" ? req.route.path : req.path;
   return {
     requestId: currentRequestId(req, res),
-    route: `${req.method} ${routePath}`
+    route: `${req.method} ${routePath}`,
+    signal: requestAbortSignal(req, res)
   };
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+  throw signal.reason instanceof Error ? signal.reason : clientAbortError();
 }
 
 function parseJsonString(value: string): unknown {
@@ -141,17 +175,36 @@ function hasTimeoutSignal(error: unknown, depth = 0): boolean {
   const message = String(record.message ?? "");
   if (
     name === "TimeoutError" ||
-    name === "AbortError" ||
     code === "UND_ERR_HEADERS_TIMEOUT" ||
     code === "RESEARCH_RESPONSE_TIMEOUT" ||
-    /timeout|aborted/i.test(message)
+    /timeout/i.test(message)
   ) {
     return true;
   }
   return hasTimeoutSignal(record.cause, depth + 1);
 }
 
+function hasAbortSignal(error: unknown, depth = 0): boolean {
+  if (!error || depth > 3) return false;
+  const record =
+    error instanceof Error
+      ? (error as Error & { code?: unknown; cause?: unknown })
+      : typeof error === "object"
+        ? (error as Record<string, unknown>)
+        : null;
+  if (!record) return /abort|aborted|cancelled|canceled/i.test(String(error));
+
+  const name = String(record.name ?? "");
+  const code = String(record.code ?? "");
+  const message = String(record.message ?? "");
+  if (name === "AbortError" || code === "ABORT_ERR" || /abort|aborted|cancelled|canceled/i.test(message)) {
+    return true;
+  }
+  return hasAbortSignal(record.cause, depth + 1);
+}
+
 function statusFromError(error: unknown): number {
+  if (hasAbortSignal(error)) return 499;
   if (hasTimeoutSignal(error)) return 504;
   const status = typeof error === "object" && error !== null && "status" in error ? Number((error as { status: unknown }).status) : 500;
   return Number.isFinite(status) && status >= 400 ? status : 500;
@@ -915,10 +968,10 @@ function preparePayloadForLlmPrompt(
     llm_output_max_tokens:
       payload.llm_output_max_tokens ??
       (options.mode === "discovery"
-        ? Math.max(1100, Math.min(1900, 900 + (numberValue(payload.limit) ?? 3) * 300))
+        ? Math.max(3000, Math.min(4096, 1600 + (numberValue(payload.limit) ?? 3) * 900))
         : options.agentName === "researcher"
-          ? 1400
-          : 1050),
+          ? 4096
+          : 3072),
     llm_input_budget: {
       mode: budget.mode,
       max_bytes: budget.maxBytes,
@@ -1114,6 +1167,115 @@ function discoveryContextSummary(payload: JsonRecord): JsonRecord {
   };
 }
 
+function discoveryMaxCollectorRounds(): number {
+  const configured = Number(process.env.DISCOVERY_MAX_COLLECTOR_ROUNDS ?? 1);
+  return Math.max(0, Math.min(Number.isFinite(configured) ? Math.floor(configured) : 1, 3));
+}
+
+function discoveryNextAction(output: JsonRecord): string {
+  return String(output.next_action ?? "").trim();
+}
+
+function discoveryHasCandidates(output: JsonRecord): boolean {
+  return Array.isArray(output.hypotheses) && output.hypotheses.some((item) => trimText(asJsonRecord(item).title, 220));
+}
+
+function discoveryOutputNeedsCollector(output: JsonRecord): boolean {
+  return discoveryNextAction(output) === "request_data";
+}
+
+async function runDiscoveryAgentLoop(params: {
+  basePayload: JsonRecord;
+  focus?: string;
+  sector?: string;
+  query: string;
+  since: string;
+  lookbackDays: number;
+  documentLimit: number;
+  promoteLimit: number;
+  context: ApiRequestContext;
+}): Promise<{ output: JsonRecord; payload: JsonRecord; llmPayload: JsonRecord; discoveryRuns: JsonRecord[]; collectorOperations: JsonRecord[]; collectorErrors: string[] }> {
+  const maxCollectorRounds = discoveryMaxCollectorRounds();
+  const discoveryRuns: JsonRecord[] = [];
+  const collectorOperations: JsonRecord[] = [];
+  const collectorErrors: string[] = [];
+  let workingPayload: JsonRecord = {
+    ...params.basePayload,
+    discovery_depth_policy: {
+      purpose: "candidate_generation_not_full_verification",
+      max_collector_rounds: maxCollectorRounds,
+      save_draft_when_testable_candidate_exists: true,
+      request_data_only_when_no_candidate_should_be_saved: true,
+      verification_belongs_to_hypothesis_loop: true
+    }
+  };
+  let llmPayload: JsonRecord = preparePayloadForLlmPrompt(workingPayload, {
+    mode: "discovery",
+    hypothesisType: "global",
+    topicText: [params.focus, params.sector, params.query].filter(Boolean).join(" ")
+  });
+  let output: JsonRecord = {};
+
+  for (let turn = 1; turn <= maxCollectorRounds + 1; turn += 1) {
+    throwIfAborted(params.context.signal);
+    output = await researchPost<JsonRecord>("/hypotheses/discover", llmPayload, params.context);
+    discoveryRuns.push({
+      turn,
+      agent_name: "discovery",
+      next_action: output.next_action ?? null,
+      reason: trimText(output.reason, 500),
+      hypotheses: Array.isArray(output.hypotheses) ? output.hypotheses.length : 0,
+      signals: Array.isArray(output.signals) ? output.signals.length : 0,
+      llm_json_repaired: output.llm_json_repaired === true,
+      context_summary: discoveryContextSummary(llmPayload)
+    });
+    throwIfAborted(params.context.signal);
+
+    if (!discoveryOutputNeedsCollector(output) || turn > maxCollectorRounds) break;
+
+    const collectorResult = await runCollectorTurn({
+      basePayload: workingPayload,
+      previousOutput: {
+        ...output,
+        agent_name: "discovery"
+      },
+      hypothesisType: "global",
+      ticker: null,
+      sector: params.sector ?? params.focus,
+      since: params.since,
+      lookbackDays: params.lookbackDays,
+      documentLimit: params.documentLimit,
+      priceLimit: 0
+    });
+    workingPayload = {
+      ...collectorResult.payload,
+      discovery_history: [
+        ...(Array.isArray(workingPayload.discovery_history) ? workingPayload.discovery_history : []),
+        loopOutputExcerpt({ ...output, agent_name: "discovery" })
+      ]
+    };
+    const collectorOutput = collectorResult.output;
+    collectorOperations.push(...(Array.isArray(collectorOutput.operations) ? collectorOutput.operations.map(asJsonRecord) : []));
+    if (Array.isArray(collectorOutput.errors)) collectorErrors.push(...collectorOutput.errors.map(String));
+    discoveryRuns.push({
+      turn,
+      agent_name: "collector",
+      next_action: collectorOutput.next_action ?? null,
+      next_agent: collectorOutput.next_agent ?? null,
+      reason: trimText(collectorOutput.reason_for_next_action, 500),
+      tool_calls: Array.isArray(collectorOutput.tool_calls) ? collectorOutput.tool_calls.length : 0,
+      errors: Array.isArray(collectorOutput.errors) ? collectorOutput.errors : []
+    });
+    llmPayload = preparePayloadForLlmPrompt(workingPayload, {
+      mode: "discovery",
+      hypothesisType: "global",
+      topicText: [params.focus, params.sector, params.query].filter(Boolean).join(" ")
+    });
+  }
+
+  return { output, payload: workingPayload, llmPayload, discoveryRuns, collectorOperations, collectorErrors };
+}
+
 function daysAgoIso(days: number): string {
   const date = new Date();
   date.setUTCDate(date.getUTCDate() - days);
@@ -1124,7 +1286,7 @@ type LlmAgentName = "hypothesis" | "skeptic" | "researcher";
 type AgentName = LlmAgentName | "collector";
 
 const HYPOTHESIS_LOOP_INSTRUCTION =
-  "仮説検証、反証、深堀り・リサーチ、データ収集の工程がnext_agentで互いに呼び出しあいます。各工程はrouting_contextを見て、次に呼ぶべき工程を自律的に指定してください。データ不足ならnext_action=request_dataでcollectorを指定できます。collectorは不足情報に応じて、政策・公的統計・信頼ニュース本文・指定された銘柄の決算/株価/ニュースを追加取得します。候補企業群の整理や統合判断はhypothesis/skeptic/researcherが担当します。finalizeできるのはresearcherだけですが、根拠と反証が不足している場合はfinalizeせず次工程を指定してください。";
+  "仮説検証、反証、深堀り・リサーチ、データ収集の工程がnext_agentで互いに呼び出しあいます。各工程はrouting_contextを見て、次に呼ぶべき工程を自律的に指定してください。APIはnext_action/next_agentを推測補完しません。制御値が欠落・不正な場合はそこで停止してログ化されます。データ不足ならnext_action=request_data、next_agent=collectorを明示してください。collectorは不足情報に応じて、政策・公的統計・信頼ニュース本文・指定された銘柄の決算/株価/ニュースを追加取得します。候補企業群の整理や統合判断はhypothesis/skeptic/researcherが担当します。finalizeできるのはresearcherだけですが、根拠と反証が不足している場合はfinalizeせず次工程を指定してください。";
 const HYPOTHESIS_FINALIZE_INSTRUCTION =
   "ここまでの仮説検証・反証を統合してください。根拠と反証が結論に十分ならresearcherとしてfinal_decisionとfinal_reportを出し、不足が結論を左右する場合はfinalizeせず次工程を指定してください。";
 
@@ -1140,13 +1302,6 @@ function safeLoopAgentName(value: unknown, fallback: AgentName = "researcher"): 
 function parseLoopAgentName(value: unknown): AgentName | null {
   if (value === "hypothesis" || value === "skeptic" || value === "researcher" || value === "collector") return value;
   return null;
-}
-
-function defaultLoopNextAgent(agentName: AgentName): AgentName {
-  if (agentName === "hypothesis") return "skeptic";
-  if (agentName === "skeptic") return "researcher";
-  if (agentName === "collector") return "skeptic";
-  return "hypothesis";
 }
 
 function loopPhase(agentName: AgentName): string {
@@ -2008,67 +2163,48 @@ function researcherHasFinalized(agentName: AgentName, output: JsonRecord): boole
   if (agentName !== "researcher") return false;
   if (hasLlmParseFailure(output)) return false;
   const nextAction = normalizedNextAction(output);
-  return nextAction === "finalize" || nextAction === "stop" || output.should_continue === false;
-}
-
-function outputTextForRouting(output: JsonRecord): string {
-  return normalizeCollectorText(
-    [
-      output.reason,
-      output.reason_for_next_action,
-      output.ui_summary,
-      output.handoff_text,
-      output.final_report,
-      output.missing_information,
-      output.recommended_next_research,
-      output.questions,
-      output.data_requests,
-      output.tool_calls
-    ]
-      .map((value) => {
-        if (Array.isArray(value)) return value.map((item) => (typeof item === "string" ? item : JSON.stringify(item))).join(" ");
-        if (value && typeof value === "object") return JSON.stringify(value);
-        return String(value ?? "");
-      })
-      .join(" ")
-  ).toLowerCase();
-}
-
-function globalCompanyMissingBlocker(output: JsonRecord): boolean {
-  const text = outputTextForRouting(output);
-  const treatsMissingCompanyAsBlocker =
-    /(調査対象企業|対象企業|対象銘柄|個別銘柄|company|ticker).{0,50}(未設定|未指定|特定されていない|特定がない|指定がない|存在しない|ないため)/.test(
-      text
-    ) ||
-    /(個別企業|個別銘柄).{0,50}(評価|分析|判断).{0,30}(できない|できません|不可能)/.test(text) ||
-    /(対象銘柄|対象企業).{0,50}(ないため|ないので).{0,50}(評価|分析|判断).{0,30}(できない|できません|不可能)/.test(text);
-  if (!treatsMissingCompanyAsBlocker) return false;
-  return !/(候補企業群|企業特性|有望セクター|マクロ伝播|代表例|promising_sectors|candidate_company_groups|beneficiary_company_traits)/.test(text);
-}
-
-function shouldRerouteResearcherToCollector(agentName: AgentName, output: JsonRecord, agentRuns: JsonRecord[]): boolean {
-  if (!researcherHasFinalized(agentName, output)) return false;
-  const collectorRuns = agentRuns.filter((run) => run.agent_name === "collector").length;
-  if (collectorRuns >= 3) return false;
-  const text = outputTextForRouting(output);
-  const missingCount = Array.isArray(output.missing_information) ? output.missing_information.length : 0;
-  const researchCount = Array.isArray(output.recommended_next_research) ? output.recommended_next_research.length : 0;
-  const explicitCollectorNeed = /collector|データ取得|取得が必須|追加取得|一次情報|財務データ|業界統計|政府答弁|国会|公的統計|開示|不足/.test(text);
-  const conclusionBlocks = /結論を左右しない|十分な根拠|主要な根拠と主要な反証が揃/.test(text);
-  return explicitCollectorNeed && !conclusionBlocks && (missingCount > 0 || researchCount > 0 || /不足|必須/.test(text));
+  return nextAction === "finalize";
 }
 
 function hasLlmParseFailure(output: JsonRecord): boolean {
   return Boolean(output.llm_parse_failed || output.llm_parse_warning || output.llm_control_parse_warning || output.raw_model_output || output.llm_fallback);
 }
 
-function selectNextAgent(agentName: AgentName, output: JsonRecord): AgentName {
+function validateLoopControl(agentName: AgentName, output: JsonRecord): string | null {
+  if (hasLlmParseFailure(output)) return trimText(output.llm_control_parse_warning ?? output.llm_parse_warning, 240) ?? "llm_control_parse_failed";
   const nextAction = normalizedNextAction(output);
   const requested = parseLoopAgentName(output.next_agent);
-  if (requested) return requested;
-  if (nextAction === "request_data") return "collector";
-  if (nextAction === "finalize" || nextAction === "stop") return "researcher";
-  return defaultLoopNextAgent(agentName);
+
+  if (!["call_agent", "request_data", "finalize", "stop"].includes(nextAction)) {
+    return "next_action_missing_or_invalid";
+  }
+  if (typeof output.should_continue !== "boolean") {
+    return "should_continue_missing_or_invalid";
+  }
+  if (nextAction === "call_agent") {
+    if (requested !== "hypothesis" && requested !== "skeptic" && requested !== "researcher") {
+      return "call_agent_requires_hypothesis_skeptic_or_researcher";
+    }
+    return null;
+  }
+  if (nextAction === "request_data") {
+    if (requested !== "collector") return "request_data_requires_next_agent_collector";
+    return null;
+  }
+  if (nextAction === "finalize") {
+    if (agentName !== "researcher") return "only_researcher_can_finalize";
+    if (output.next_agent !== null && output.next_agent !== undefined) return "finalize_requires_null_next_agent";
+    return null;
+  }
+  if (nextAction === "stop") {
+    if (output.next_agent !== null && output.next_agent !== undefined) return "stop_requires_null_next_agent";
+    return null;
+  }
+  return "next_action_missing_or_invalid";
+}
+
+function nextAgentFromControl(output: JsonRecord): AgentName | null {
+  return parseLoopAgentName(output.next_agent);
 }
 
 function loopSummary(output: JsonRecord): string | undefined {
@@ -2112,6 +2248,7 @@ function routingContext(agentName: AgentName, agentRuns: JsonRecord[]): JsonReco
     ],
     routing_guidance: [
       "next_agentはAPIではなく各エージェントが指定する",
+      "APIはnext_action/next_agentを推測補完しない。不正・欠落時はinvalid_controlとして停止する",
       "同じエージェントを続けて呼ぶのは、新しい入力や明確な追加作業がある場合に限る",
       "データ不足で判断できない場合はcollectorを呼ぶ",
       "collectorで取得したデータは、反証または統合のどちらに渡すべきかを次工程で判断する",
@@ -2237,7 +2374,7 @@ async function runHypothesisLoopOneTurnAtATime(params: {
   lookbackDays: number;
   documentLimit: number;
   priceLimit: number;
-  context: { requestId: string; route: string };
+  context: ApiRequestContext;
 }): Promise<JsonRecord> {
   const safetyMaxTurns = hypothesisLoopSafetyMaxTurns();
   const agentRuns: JsonRecord[] = [];
@@ -2260,6 +2397,7 @@ async function runHypothesisLoopOneTurnAtATime(params: {
   );
 
   for (let turn = 1; turn <= safetyMaxTurns; turn += 1) {
+    throwIfAborted(params.context.signal);
     const reachedSafetyTurn = turn === safetyMaxTurns;
     const agentName = currentAgent;
     const agentHandoff = buildAgentHandoff(agentName, agentRuns);
@@ -2327,83 +2465,88 @@ async function runHypothesisLoopOneTurnAtATime(params: {
       });
       workingPayload = collectorResult.payload;
       agentOutput = collectorResult.output;
+      if (params.context.signal.aborted) {
+        const durationMs = Date.now() - turnStartedAt;
+        const cancelledOutput: JsonRecord = {
+          agent_name: agentName,
+          input: inputSummary,
+          loop_turn: turn,
+          duration_ms: durationMs,
+          turn_timeout_ms: config.researchTimeoutMs,
+          next_action: "cancelled",
+          next_agent: null,
+          status: "cancelled",
+          error: "request_cancelled"
+        };
+        await updateAgentRun(startedRun.id, {
+          input: inputSummary,
+          output: cancelledOutput,
+          next_action: "cancelled",
+          next_agent: null
+        });
+        logger.warn(
+          {
+            request_id: params.context.requestId,
+            hypothesis_id: params.hypothesisId,
+            turn,
+            agent_name: agentName,
+            duration_ms: durationMs
+          },
+          "hypothesis loop turn cancelled"
+        );
+        throwIfAborted(params.context.signal);
+      }
     } else {
       try {
         agentOutput = await researchPost<JsonRecord>(`/agents/${agentName}`, turnPayload, params.context);
       } catch (error) {
         const durationMs = Date.now() - turnStartedAt;
         const details = error instanceof ResearchError ? normalizeDetails(error.details) : serializeError(error);
+        const wasAborted = params.context.signal.aborted || hasAbortSignal(error);
         const failedOutput: JsonRecord = {
           agent_name: agentName,
           input: inputSummary,
           loop_turn: turn,
           duration_ms: durationMs,
           turn_timeout_ms: config.researchTimeoutMs,
-          next_action: "error",
+          next_action: wasAborted ? "cancelled" : "error",
           next_agent: null,
-          error: "llm_request_failed",
+          status: wasAborted ? "cancelled" : "error",
+          error: wasAborted ? "request_cancelled" : "llm_request_failed",
           details
         };
         await updateAgentRun(startedRun.id, {
           input: { ...inputSummary, request_payload: turnPayload },
           output: failedOutput,
-          next_action: "error",
+          next_action: wasAborted ? "cancelled" : "error",
           next_agent: null
         });
-        logger.error(
-          {
-            request_id: params.context.requestId,
-            hypothesis_id: params.hypothesisId,
-            turn,
-            agent_name: agentName,
-            duration_ms: durationMs,
-            error: details
-          },
-          "hypothesis loop turn failed"
-        );
+        const logPayload = {
+          request_id: params.context.requestId,
+          hypothesis_id: params.hypothesisId,
+          turn,
+          agent_name: agentName,
+          duration_ms: durationMs,
+          error: details
+        };
+        if (wasAborted) {
+          logger.warn(logPayload, "hypothesis loop turn cancelled");
+        } else {
+          logger.error(logPayload, "hypothesis loop turn failed");
+        }
         throw error;
       }
     }
     const durationMs = Date.now() - turnStartedAt;
-    const globalCompanyMisread = params.hypothesisType === "global" && agentName !== "collector" && globalCompanyMissingBlocker(agentOutput);
-    const rerouteToCollector = !globalCompanyMisread && shouldRerouteResearcherToCollector(agentName, agentOutput, agentRuns);
-    const effectiveAgentOutput: JsonRecord = globalCompanyMisread
-      ? {
-          ...agentOutput,
-          next_action: "call_agent",
-          next_agent: agentName === "researcher" ? "hypothesis" : "researcher",
-          should_continue: true,
-          api_routing_override: {
-            from_next_action: agentOutput.next_action ?? null,
-            from_next_agent: agentOutput.next_agent ?? null,
-            reason: "Global hypothesis output treated missing company/ticker as a blocker. Global hypotheses should analyze sectors, company traits, and candidate groups without a preselected ticker."
-          },
-          reason_for_next_action:
-            "global仮説ではcompany/ticker未指定は正常です。対象企業なしを理由に判断不能にせず、有望セクター、マクロ伝播経路、企業特性、候補企業群の方向へ再整理します。"
-        }
-      : rerouteToCollector
-      ? {
-          ...agentOutput,
-          next_action: "request_data",
-          next_agent: "collector",
-          should_continue: true,
-          api_routing_override: {
-            from_next_action: agentOutput.next_action ?? null,
-            from_next_agent: agentOutput.next_agent ?? null,
-            reason: "Researcher output described missing high-priority data or collector-required evidence, so finalize was deferred."
-          },
-          reason_for_next_action:
-            trimText(agentOutput.reason_for_next_action ?? agentOutput.reason, 420) ??
-            "不足情報が結論を左右するため、Collectorで追加データを取得します。"
-        }
-      : agentOutput;
-    const finalized = researcherHasFinalized(agentName, effectiveAgentOutput);
-    const selectedNextAgent = finalized ? null : selectNextAgent(agentName, effectiveAgentOutput);
-    const nextAgent = finalized || reachedSafetyTurn ? null : selectedNextAgent;
+    const controlError = validateLoopControl(agentName, agentOutput);
+    const stopRequested = !controlError && normalizedNextAction(agentOutput) === "stop";
+    const finalized = !controlError && researcherHasFinalized(agentName, agentOutput);
+    const selectedNextAgent = finalized || stopRequested || controlError ? null : nextAgentFromControl(agentOutput);
+    const nextAgent = finalized || stopRequested || controlError || reachedSafetyTurn ? null : selectedNextAgent;
     const runOutput: JsonRecord = {
-      ...effectiveAgentOutput,
+      ...agentOutput,
       id: startedRun.id,
-      status: "completed",
+      status: controlError ? "invalid_control" : "completed",
       agent_name: agentName,
       input: inputSummary,
       loop_turn: turn,
@@ -2411,6 +2554,7 @@ async function runHypothesisLoopOneTurnAtATime(params: {
       turn_timeout_ms: config.researchTimeoutMs,
       requested_next_agent: agentOutput.next_agent ?? null,
       requested_next_action: agentOutput.next_action ?? null,
+      control_error: controlError ?? undefined,
       next_agent: nextAgent
     };
     const traceItem: JsonRecord = {
@@ -2421,6 +2565,7 @@ async function runHypothesisLoopOneTurnAtATime(params: {
       next_action: runOutput.next_action,
       next_agent: runOutput.next_agent,
       should_continue: runOutput.should_continue,
+      control_error: controlError,
       duration_ms: durationMs,
       timeout_ms: config.researchTimeoutMs,
       summary: loopSummary(runOutput)
@@ -2431,7 +2576,7 @@ async function runHypothesisLoopOneTurnAtATime(params: {
     await updateAgentRun(startedRun.id, {
       input: inputSummary,
       output: runOutput,
-      next_action: typeof runOutput.next_action === "string" ? runOutput.next_action : undefined,
+      next_action: typeof runOutput.next_action === "string" ? runOutput.next_action : controlError ? "invalid_control" : undefined,
       next_agent: typeof runOutput.next_agent === "string" ? runOutput.next_agent : undefined
     });
 
@@ -2444,36 +2589,31 @@ async function runHypothesisLoopOneTurnAtATime(params: {
         next_action: runOutput.next_action,
         next_agent: runOutput.next_agent,
         should_continue: runOutput.should_continue,
+        control_error: controlError,
         duration_ms: durationMs,
         finalized
       },
       "hypothesis loop turn completed"
     );
 
-    if (hasLlmParseFailure(runOutput)) {
-      workingPayload = {
-        ...workingPayload,
-        llm_thinking_mode: "no_think",
-        llm_recovery_instruction:
-          "前回のLLM応答はJSON整形に失敗しました。次ターンではthinkを無効化し、JSONのみを短く返してください。"
-      };
-    }
-
-    if (globalCompanyMisread) {
-      workingPayload = {
-        ...workingPayload,
-        global_research_instruction:
-          "global仮説ではcompany/ticker未指定は正常です。対象企業なしを理由に判断不能にせず、有望セクター、マクロ伝播経路、注目企業特性、候補企業群・代表例、不足データを整理してください。候補企業群の整理はhypothesis/skeptic/researcherが行い、collectorには具体的な情報取得だけをdata_requestsで依頼してください。"
-      };
-    }
-
-    if (finalized || reachedSafetyTurn) {
+    if (controlError || finalized || stopRequested || reachedSafetyTurn) {
       finalOutput = runOutput;
-      stoppedReason = finalized ? "researcher_finalized" : "safety_cap_reached";
+      stoppedReason = controlError
+        ? "invalid_control"
+        : finalized
+          ? "researcher_finalized"
+          : stopRequested
+            ? "agent_stopped"
+            : "safety_cap_reached";
       break;
     }
 
-    currentAgent = nextAgent ?? defaultLoopNextAgent(agentName);
+    if (!nextAgent) {
+      finalOutput = runOutput;
+      stoppedReason = "next_agent_missing";
+      break;
+    }
+    currentAgent = nextAgent;
   }
 
   if (!finalOutput) {
@@ -2838,6 +2978,7 @@ app.post(
 app.post(
   "/api/hypotheses/discover",
   asyncHandler(async (req, res) => {
+    const context = requestContext(req, res);
     const input = hypothesisDiscoverySchema.parse(req.body ?? {});
     const focus = input.focus?.trim() || undefined;
     const sector = input.sector?.trim() || undefined;
@@ -2857,6 +2998,7 @@ app.post(
     const operations: JsonRecord[] = [];
     const errors: string[] = [];
 
+    throwIfAborted(context.signal);
     if (input.refresh !== false) {
       try {
         const result = await fetchMacroData();
@@ -2877,6 +3019,7 @@ app.post(
       }
     }
 
+    throwIfAborted(context.signal);
     const search = globalSearchTerm(sector) ?? globalSearchTerm(focus);
     const [globalResearch, companies, existingHypotheses] = await Promise.all([
       reloadGlobalResearchContext({
@@ -2943,6 +3086,13 @@ app.post(
           "話題性だけで業績インパクトが示せない"
         ]
       },
+      discovery_depth_policy: {
+        purpose: "candidate_generation_not_full_verification",
+        max_collector_rounds: discoveryMaxCollectorRounds(),
+        save_draft_when_testable_candidate_exists: true,
+        request_data_only_when_no_candidate_should_be_saved: true,
+        verification_belongs_to_hypothesis_loop: true
+      },
       llm_thinking_mode: input.llm_thinking_mode ?? "auto",
       input_summary: {
         mode: "hypothesis_discovery",
@@ -2958,18 +3108,31 @@ app.post(
         news_since: since
       }
     };
-    const llmPayload = preparePayloadForLlmPrompt(payload, {
-      mode: "discovery",
-      hypothesisType: "global",
-      topicText: [focus, sector, query].filter(Boolean).join(" ")
-    });
 
-    const output = await researchPost<JsonRecord>("/hypotheses/discover", llmPayload, requestContext(req, res));
-    const candidateRecords = Array.isArray(output.hypotheses) ? output.hypotheses.map(asJsonRecord).slice(0, promoteLimit) : [];
+    throwIfAborted(context.signal);
+    const discoveryLoop = await runDiscoveryAgentLoop({
+      basePayload: payload,
+      focus,
+      sector,
+      query,
+      since,
+      lookbackDays,
+      documentLimit,
+      promoteLimit,
+      context
+    });
+    const output = discoveryLoop.output;
+    const llmPayload = discoveryLoop.llmPayload;
+    throwIfAborted(context.signal);
+    const discoveryNextAction = String(output.next_action ?? "").trim();
+    const candidateRecords =
+      discoveryNextAction === "create_hypotheses" && Array.isArray(output.hypotheses)
+        ? output.hypotheses.map(asJsonRecord).slice(0, promoteLimit)
+        : [];
     const created: Hypothesis[] = [];
     const skipped: JsonRecord[] = [];
 
-    if (input.create !== false) {
+    if (input.create !== false && discoveryNextAction === "create_hypotheses") {
       for (const candidate of candidateRecords) {
         const title = trimText(candidate.title, 220);
         if (!title) {
@@ -3025,8 +3188,9 @@ app.post(
       output,
       created,
       skipped,
-      collector_operations: operations,
-      collector_errors: errors,
+      discovery_runs: discoveryLoop.discoveryRuns,
+      collector_operations: [...operations, ...discoveryLoop.collectorOperations],
+      collector_errors: [...errors, ...discoveryLoop.collectorErrors],
       context_summary: discoveryContextSummary(llmPayload)
     });
   })
@@ -3303,6 +3467,10 @@ app.use((req, res) => {
 
 app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
   const requestId = currentRequestId(req, res);
+  if (res.headersSent || res.writableEnded) {
+    logger.warn({ request_id: requestId, method: req.method, path: req.originalUrl, error: serializeError(error) }, "request failed after response closed");
+    return;
+  }
 
   if (error instanceof z.ZodError) {
     logger.warn({ request_id: requestId, method: req.method, path: req.originalUrl, issues: error.issues }, "validation failed");
@@ -3336,10 +3504,17 @@ app.use((error: unknown, req: Request, res: Response, _next: NextFunction) => {
 
   const status = statusFromError(error);
   const serializedError = serializeError(error);
-  logger.error({ request_id: requestId, method: req.method, path: req.originalUrl, status, error: serializedError }, "request failed");
+  logger[status === 499 ? "warn" : "error"]({ request_id: requestId, method: req.method, path: req.originalUrl, status, error: serializedError }, "request failed");
   res.status(status).json({
-    error: status === 504 ? "timeout_error" : "internal_error",
-    message: status === 504 ? "Upstream request timed out before the response reached the API" : typeof serializedError.message === "string" ? serializedError.message : "Unknown error",
+    error: status === 499 ? "request_cancelled" : status === 504 ? "timeout_error" : "internal_error",
+    message:
+      status === 499
+        ? "Request was cancelled by the client"
+        : status === 504
+          ? "Upstream request timed out before the response reached the API"
+          : typeof serializedError.message === "string"
+            ? serializedError.message
+            : "Unknown error",
     details: serializedError,
     request_id: requestId
   });

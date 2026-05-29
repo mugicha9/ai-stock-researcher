@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -13,9 +14,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 
-from .fallback import agent_response, discovery_response, document_summary
+from .fallback import discovery_response, document_summary
 from .llama_client import LlamaClient
 from .prompts import AGENT_SYSTEMS, DISCOVERY_SYSTEM, SUMMARY_SYSTEM, agent_user_prompt, discovery_user_prompt, summary_user_prompt
 from .schemas import AgentRequest, CompanyResearchRequest, DocumentSummaryRequest
@@ -23,6 +24,7 @@ from .schemas import AgentRequest, CompanyResearchRequest, DocumentSummaryReques
 app = FastAPI(title="Stock Research Backend", version="0.1.0")
 llama = LlamaClient()
 logger = logging.getLogger("research.api")
+active_request_tasks: dict[str, asyncio.Task[Any]] = {}
 
 
 def log_event(event: str, **fields: Any) -> None:
@@ -36,8 +38,30 @@ def bool_env(name: str, fallback: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def int_env(name: str, fallback: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(os.getenv(name, str(fallback)))
+    except (TypeError, ValueError):
+        value = fallback
+    return max(minimum, min(value, maximum))
+
+
 def request_id(request: Request) -> str:
     return request.headers.get("x-request-id") or str(uuid.uuid4())
+
+
+def register_active_request(current_request_id: str | None) -> asyncio.Task[Any] | None:
+    if not current_request_id:
+        return None
+    task = asyncio.current_task()
+    if task is not None:
+        active_request_tasks[current_request_id] = task
+    return task
+
+
+def unregister_active_request(current_request_id: str | None, task: asyncio.Task[Any] | None) -> None:
+    if current_request_id and task is not None and active_request_tasks.get(current_request_id) is task:
+        active_request_tasks.pop(current_request_id, None)
 
 
 def payload_stats(payload: dict[str, Any]) -> dict[str, Any]:
@@ -95,10 +119,10 @@ def thinking_system_instruction(enabled: bool) -> str:
 
 def thinking_text_instruction(enabled: bool) -> str:
     if enabled:
-        return " 必要なら内部で深く検討してよいですが、最終出力には思考過程ではなく、次工程へ渡す分析本文とCONTROL_JSONだけを書いてください。"
+        return " 必要なら内部で深く検討してよいですが、最終出力には思考過程ではなく、先頭のCONTROL_JSONと次工程へ渡す分析本文だけを書いてください。"
     return (
         " /no_think "
-        "内部推論、<think>、Markdownコードフェンスを出さず、次工程へ渡す分析本文と最後のCONTROL_JSONだけを出してください。"
+        "内部推論、<think>、Markdownコードフェンスを出さず、先頭のCONTROL_JSONと次工程へ渡す分析本文だけを出してください。"
     )
 
 
@@ -112,32 +136,50 @@ def resolve_thinking_enabled(payload: dict[str, Any]) -> tuple[bool, str]:
 
 
 def discovery_max_tokens(payload: dict[str, Any]) -> int:
+    cap = int_env("LLM_DISCOVERY_MAX_TOKENS", 4096, 1200, 8192)
     configured = payload.get("llm_output_max_tokens")
     if configured is not None:
         try:
-            return max(900, min(int(configured), 2400))
+            return max(900, min(int(configured), cap))
         except (TypeError, ValueError):
             pass
     try:
         candidate_limit = int(payload.get("limit") or 4)
     except (TypeError, ValueError):
         candidate_limit = 4
-    return max(1400, min(3000, 900 + candidate_limit * 350))
+    return max(1800, min(cap, 1600 + candidate_limit * 900))
 
 
 def agent_max_tokens(agent_name: str, payload: dict[str, Any], override: int | None = None) -> int:
     if override is not None:
         return override
+    cap = (
+        int_env("LLM_RESEARCHER_MAX_TOKENS", 4096, 1200, 8192)
+        if agent_name == "researcher"
+        else int_env("LLM_AGENT_MAX_TOKENS", 3072, 900, 8192)
+    )
     configured = payload.get("llm_output_max_tokens")
     if configured is not None:
         try:
-            return max(700, min(int(configured), 2200))
+            return max(700, min(int(configured), cap))
         except (TypeError, ValueError):
             pass
-    return 2200 if agent_name == "researcher" else 1600
+    return cap
 
 
 CONTROL_BLOCK_RE = re.compile(r"<CONTROL_JSON>\s*(\{.*?\})\s*</CONTROL_JSON>", re.DOTALL | re.IGNORECASE)
+CONTROL_KEYS = {
+    "next_action",
+    "next_agent",
+    "should_continue",
+    "ui_summary",
+    "reason_for_next_action",
+    "data_requests",
+    "missing_information",
+    "recommended_next_research",
+    "final_decision",
+    "final_report",
+}
 
 
 def text_excerpt(value: Any, limit: int = 4000) -> str:
@@ -147,24 +189,63 @@ def text_excerpt(value: Any, limit: int = 4000) -> str:
     return text if len(text) <= limit else f"{text[:limit]}\n...[truncated {len(text) - limit} chars]"
 
 
+def strip_json_code_fence(value: str) -> str:
+    text = value.strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    return fenced.group(1).strip() if fenced else text
+
+
+def has_control_keys(value: Any) -> bool:
+    return isinstance(value, dict) and any(key in value for key in CONTROL_KEYS)
+
+
+def decode_control_fragment(value: str) -> tuple[dict[str, Any], str] | None:
+    text = strip_json_code_fence(value)
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        start = match.start()
+        fragment = text[start:]
+        left_trimmed = fragment.lstrip()
+        leading = len(fragment) - len(left_trimmed)
+        try:
+            parsed, end = decoder.raw_decode(left_trimmed)
+        except Exception:
+            continue
+        if not has_control_keys(parsed):
+            continue
+        end_index = start + leading + end
+        handoff = f"{text[:start].strip()}\n{text[end_index:].strip()}".strip()
+        return parsed, handoff
+    return None
+
+
 def extract_control_json(content: str) -> tuple[dict[str, Any], str, str | None]:
     text = str(content or "").strip()
     match = CONTROL_BLOCK_RE.search(text)
     raw_control: str | None = match.group(1) if match else None
-    if raw_control is None:
-        marker = re.search(r"CONTROL_JSON\s*:?\s*(\{.*\})\s*$", text, flags=re.DOTALL | re.IGNORECASE)
-        raw_control = marker.group(1) if marker else None
-        match = marker
-    handoff = text[: match.start()].strip() if match else text
-    if raw_control is None:
-        return {}, text_excerpt(handoff), "control_json_missing"
-    try:
-        parsed = json.loads(raw_control)
-        if isinstance(parsed, dict):
+    if match:
+        handoff = f"{text[: match.start()].strip()}\n{text[match.end() :].strip()}".strip()
+        try:
+            parsed = json.loads(raw_control)
+            if isinstance(parsed, dict):
+                return parsed, text_excerpt(handoff), None
+            return {}, text_excerpt(handoff), "control_json_not_object"
+        except Exception as exc:
+            return {}, text_excerpt(handoff), f"control_json_parse_failed: {exc}"
+
+    marker = re.search(r"CONTROL_JSON\s*:?", text, flags=re.IGNORECASE)
+    if marker:
+        decoded = decode_control_fragment(text[marker.end() :])
+        if decoded:
+            parsed, marker_handoff = decoded
+            handoff = f"{text[: marker.start()].strip()}\n{marker_handoff}".strip()
             return parsed, text_excerpt(handoff), None
-        return {}, text_excerpt(handoff), "control_json_not_object"
-    except Exception as exc:
-        return {}, text_excerpt(handoff), f"control_json_parse_failed: {exc}"
+
+    decoded = decode_control_fragment(text)
+    if decoded:
+        parsed, handoff = decoded
+        return parsed, text_excerpt(handoff), None
+    return {}, text_excerpt(text), "control_json_missing"
 
 
 def compact_string_list(value: Any, limit: int = 6, item_limit: int = 180) -> list[str]:
@@ -196,21 +277,21 @@ def compact_dict_list(value: Any, limit: int, allowed_keys: set[str]) -> list[di
     return output
 
 
-def normalize_next_agent(value: Any, fallback: str | None) -> str | None:
+def normalize_next_agent(value: Any) -> str | None:
     if value in {"hypothesis", "skeptic", "researcher", "collector"}:
         return str(value)
     if value is None or value == "null":
         return None
-    return fallback
+    return None
 
 
-def normalize_next_action(value: Any, fallback: str = "call_agent") -> str:
+def normalize_next_action(value: Any) -> str | None:
     if value in {"call_agent", "request_data", "finalize", "stop"}:
         return str(value)
-    return fallback
+    return None
 
 
-def normalize_bool(value: Any, fallback: bool) -> bool:
+def normalize_bool(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -219,36 +300,70 @@ def normalize_bool(value: Any, fallback: bool) -> bool:
             return True
         if lowered in {"false", "no", "0"}:
             return False
-    return fallback
+    return None
+
+
+def control_validation_error(agent_name: str, control: dict[str, Any], parse_warning: str | None) -> str | None:
+    if parse_warning:
+        return parse_warning
+
+    next_action = normalize_next_action(control.get("next_action"))
+    next_agent = normalize_next_agent(control.get("next_agent"))
+    should_continue = normalize_bool(control.get("should_continue"))
+
+    if next_action is None:
+        return "next_action_missing_or_invalid"
+    if should_continue is None:
+        return "should_continue_missing_or_invalid"
+
+    if next_action == "call_agent":
+        if next_agent not in {"hypothesis", "skeptic", "researcher"}:
+            return "call_agent_requires_hypothesis_skeptic_or_researcher"
+        return None
+
+    if next_action == "request_data":
+        if next_agent != "collector":
+            return "request_data_requires_next_agent_collector"
+        return None
+
+    if next_action == "finalize":
+        if agent_name != "researcher":
+            return "only_researcher_can_finalize"
+        if next_agent is not None:
+            return "finalize_requires_null_next_agent"
+        return None
+
+    if next_action == "stop":
+        if next_agent is not None:
+            return "stop_requires_null_next_agent"
+        return None
+
+    return "next_action_missing_or_invalid"
 
 
 def normalize_agent_text_output(
     agent_name: str,
-    payload: dict[str, Any],
     text_result: dict[str, Any],
-    fallback: dict[str, Any],
 ) -> dict[str, Any]:
     content = str(text_result.get("content") or "")
     control, handoff_text, parse_warning = extract_control_json(content)
-    fallback_next_agent = fallback.get("next_agent") if isinstance(fallback.get("next_agent"), str) else "researcher"
-    next_action = normalize_next_action(control.get("next_action"), str(fallback.get("next_action") or "call_agent"))
-    inferred_next_agent = "collector" if next_action == "request_data" else fallback_next_agent
-    next_agent = normalize_next_agent(control.get("next_agent"), inferred_next_agent)
-    if next_action in {"finalize", "stop"}:
-        next_agent = None if control.get("next_agent") in {None, "null"} else next_agent
+    next_action = normalize_next_action(control.get("next_action"))
+    next_agent = normalize_next_agent(control.get("next_agent"))
+    should_continue = normalize_bool(control.get("should_continue"))
+    validation_error = control_validation_error(agent_name, control, parse_warning)
+
+    missing_control_message = "LLM応答はありましたが、有効なCONTROL_JSONを抽出できませんでした。"
+    summary_source = control.get("ui_summary") or control.get("summary") or handoff_text or missing_control_message
+    reason_source = control.get("reason_for_next_action") or control.get("reason") or summary_source
 
     output: dict[str, Any] = {
-        **fallback,
         "agent_name": agent_name,
         "handoff_text": handoff_text,
-        "ui_summary": text_excerpt(control.get("ui_summary") or control.get("summary") or fallback.get("ui_summary") or handoff_text, 180),
+        "ui_summary": text_excerpt(summary_source, 180),
         "next_action": next_action,
         "next_agent": next_agent,
-        "should_continue": normalize_bool(control.get("should_continue"), next_action not in {"finalize", "stop"}),
-        "reason_for_next_action": text_excerpt(
-            control.get("reason_for_next_action") or control.get("reason") or fallback.get("reason_for_next_action") or handoff_text,
-            240,
-        ),
+        "should_continue": should_continue,
+        "reason_for_next_action": text_excerpt(reason_source, 240),
         "data_requests": compact_dict_list(
             control.get("data_requests"),
             5,
@@ -258,7 +373,15 @@ def normalize_agent_text_output(
         "recommended_next_research": compact_string_list(control.get("recommended_next_research"), 6),
         "llm_control_format": "text_with_control_json",
         "llm_raw": text_result.get("llm_raw"),
+        "llm_finish_reason": text_result.get("finish_reason"),
     }
+
+    claims = compact_dict_list(control.get("claims"), 5, {"claim", "evidence_ids", "confidence", "status"})
+    questions = compact_dict_list(control.get("questions"), 5, {"question", "priority", "target_agent", "reason"})
+    if claims:
+        output["claims"] = claims
+    if questions:
+        output["questions"] = questions
 
     for key in ["final_decision", "evidence_strength", "contradiction_strength"]:
         if control.get(key) is not None:
@@ -269,8 +392,8 @@ def normalize_agent_text_output(
         output["final_report"] = text_excerpt(control.get("final_report"), 1200)
     elif agent_name == "researcher" and next_action in {"finalize", "stop"}:
         output["final_report"] = text_excerpt(handoff_text, 1200)
-    if parse_warning:
-        output["llm_control_parse_warning"] = parse_warning
+    if validation_error:
+        output["llm_control_parse_warning"] = validation_error
         output["raw_model_output"] = content[:4000]
     if text_result.get("llm_fallback"):
         output["llm_fallback"] = True
@@ -278,7 +401,7 @@ def normalize_agent_text_output(
     return output
 
 
-def normalize_discovery_output(output: dict[str, Any], fallback: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
+def normalize_discovery_output(output: dict[str, Any], payload: dict[str, Any]) -> dict[str, Any]:
     normalized = {**output}
     try:
         hypothesis_limit = max(1, min(int(payload.get("limit") or 3), 12))
@@ -306,10 +429,11 @@ def normalize_discovery_output(output: dict[str, Any], fallback: dict[str, Any],
 
     next_action = normalized.get("next_action")
     if next_action not in {"create_hypotheses", "request_data", "stop"}:
-        normalized["next_action"] = "request_data" if not normalized["hypotheses"] else "create_hypotheses"
+        normalized["next_action"] = None
+        normalized.setdefault("llm_parse_warning", "discovery next_action missing or invalid")
 
     if not isinstance(normalized.get("reason"), str) or not normalized.get("reason"):
-        normalized["reason"] = fallback.get("reason") or "仮説発見結果を正規化しました。"
+        normalized["reason"] = "仮説発見結果に有効な理由が含まれていません。"
 
     return normalized
 
@@ -320,6 +444,28 @@ async def request_logging_middleware(request: Request, call_next):  # type: igno
     started_at = time.perf_counter()
     try:
         response = await call_next(request)
+    except asyncio.CancelledError:
+        log_event(
+            "request_cancelled",
+            request_id=current_request_id,
+            api_route=request.headers.get("x-api-route"),
+            method=request.method,
+            path=request.url.path,
+            duration_ms=round((time.perf_counter() - started_at) * 1000),
+        )
+        return Response(status_code=499)
+    except RuntimeError as exc:
+        if str(exc) == "No response returned.":
+            log_event(
+                "request_cancelled",
+                request_id=current_request_id,
+                api_route=request.headers.get("x-api-route"),
+                method=request.method,
+                path=request.url.path,
+                duration_ms=round((time.perf_counter() - started_at) * 1000),
+            )
+            return Response(status_code=499)
+        raise
     except Exception:
         logger.exception(
             "request_failed %s",
@@ -356,9 +502,20 @@ async def health() -> dict[str, Any]:
     return {"ok": True, "llama": llama_health}
 
 
+@app.post("/requests/{target_request_id}/cancel")
+async def cancel_request(target_request_id: str) -> dict[str, Any]:
+    task = active_request_tasks.get(target_request_id)
+    if task is None or task.done():
+        return {"ok": True, "cancelled": False, "request_id": target_request_id, "reason": "not_active"}
+    task.cancel()
+    log_event("request_cancel_requested", request_id=target_request_id)
+    return {"ok": True, "cancelled": True, "request_id": target_request_id}
+
+
 @app.post("/documents/summarize")
 async def summarize_document(body: DocumentSummaryRequest, request: Request) -> dict[str, Any]:
     current_request_id = request_id(request)
+    active_task = register_active_request(current_request_id)
     payload = body.model_dump()
     thinking_enabled, thinking_mode = resolve_thinking_enabled(payload)
     log_event(
@@ -370,16 +527,22 @@ async def summarize_document(body: DocumentSummaryRequest, request: Request) -> 
         llm_thinking_mode=thinking_mode,
         thinking_enabled=thinking_enabled,
     )
-    return await llama.complete_json(
-        system=SUMMARY_SYSTEM + thinking_system_instruction(thinking_enabled),
-        user=summary_user_prompt(payload),
-        fallback=document_summary(payload),
-        temperature=0.1,
-        max_tokens=1800,
-        request_id=current_request_id,
-        operation="documents.summarize",
-        thinking_enabled=thinking_enabled,
-    )
+    try:
+        return await llama.complete_json(
+            system=SUMMARY_SYSTEM + thinking_system_instruction(thinking_enabled),
+            user=summary_user_prompt(payload),
+            fallback=document_summary(payload),
+            temperature=0.1,
+            max_tokens=1800,
+            request_id=current_request_id,
+            operation="documents.summarize",
+            thinking_enabled=thinking_enabled,
+        )
+    except asyncio.CancelledError:
+        log_event("document_summarize_cancelled", request_id=current_request_id)
+        raise
+    finally:
+        unregister_active_request(current_request_id, active_task)
 
 
 async def run_agent(
@@ -389,6 +552,7 @@ async def run_agent(
     current_request_id: str | None = None,
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
+    active_task = register_active_request(current_request_id)
     thinking_enabled, thinking_mode = resolve_thinking_enabled(payload)
     effective_max_tokens = agent_max_tokens(agent_name, payload, max_tokens)
     log_event(
@@ -402,18 +566,17 @@ async def run_agent(
         payload=payload_stats(payload),
     )
     try:
-        fallback = agent_response(agent_name, payload)
         text_result = await llama.complete_text(
             system=AGENT_SYSTEMS[agent_name] + thinking_text_instruction(thinking_enabled),
             user=agent_user_prompt(agent_name, payload),
-            fallback=fallback,
+            fallback={},
             temperature=0.25 if agent_name == "hypothesis" else 0.15,
             max_tokens=effective_max_tokens,
             request_id=current_request_id,
             operation=f"agent.{agent_name}",
             thinking_enabled=thinking_enabled,
         )
-        output = normalize_agent_text_output(agent_name, payload, text_result, fallback)
+        output = normalize_agent_text_output(agent_name, text_result)
         output.setdefault("agent_name", agent_name)
         output.setdefault("input", summarize_input(agent_name, payload))
         output.setdefault("llm_thinking_mode", thinking_mode)
@@ -426,6 +589,14 @@ async def run_agent(
             output_keys=list(output.keys())[:20],
         )
         return output
+    except asyncio.CancelledError:
+        log_event(
+            "agent_cancelled",
+            request_id=current_request_id,
+            agent_name=agent_name,
+            duration_ms=round((time.perf_counter() - started_at) * 1000),
+        )
+        raise
     except Exception:
         logger.exception(
             "agent_failed %s",
@@ -440,6 +611,8 @@ async def run_agent(
             ),
         )
         raise
+    finally:
+        unregister_active_request(current_request_id, active_task)
 
 
 @app.post("/agents/hypothesis")
@@ -460,6 +633,7 @@ async def researcher_agent(body: AgentRequest, request: Request) -> dict[str, An
 @app.post("/hypotheses/discover")
 async def discover_hypotheses(body: AgentRequest, request: Request) -> dict[str, Any]:
     current_request_id = request_id(request)
+    active_task = register_active_request(current_request_id)
     payload = body.model_dump()
     thinking_enabled, thinking_mode = resolve_thinking_enabled(payload)
     log_event(
@@ -472,27 +646,33 @@ async def discover_hypotheses(body: AgentRequest, request: Request) -> dict[str,
         sector=payload.get("sector"),
     )
     fallback = discovery_response(payload)
-    output = await llama.complete_json(
-        system=DISCOVERY_SYSTEM + thinking_system_instruction(thinking_enabled),
-        user=discovery_user_prompt(payload),
-        fallback=fallback,
-        temperature=0.2,
-        max_tokens=discovery_max_tokens(payload),
-        request_id=current_request_id,
-        operation="hypotheses.discover",
-        thinking_enabled=thinking_enabled,
-    )
-    output = normalize_discovery_output(output, fallback, payload)
-    output.setdefault("agent_name", "discovery")
-    output.setdefault("llm_thinking_mode", thinking_mode)
-    output.setdefault("thinking_enabled", thinking_enabled)
-    log_event(
-        "hypothesis_discovery_completed",
-        request_id=current_request_id,
-        hypotheses=len(output.get("hypotheses") or []),
-        next_action=output.get("next_action"),
-    )
-    return output
+    try:
+        output = await llama.complete_json(
+            system=DISCOVERY_SYSTEM + thinking_system_instruction(thinking_enabled),
+            user=discovery_user_prompt(payload),
+            fallback=fallback,
+            temperature=0.2,
+            max_tokens=discovery_max_tokens(payload),
+            request_id=current_request_id,
+            operation="hypotheses.discover",
+            thinking_enabled=thinking_enabled,
+        )
+        output = normalize_discovery_output(output, payload)
+        output.setdefault("agent_name", "discovery")
+        output.setdefault("llm_thinking_mode", thinking_mode)
+        output.setdefault("thinking_enabled", thinking_enabled)
+        log_event(
+            "hypothesis_discovery_completed",
+            request_id=current_request_id,
+            hypotheses=len(output.get("hypotheses") or []),
+            next_action=output.get("next_action"),
+        )
+        return output
+    except asyncio.CancelledError:
+        log_event("hypothesis_discovery_cancelled", request_id=current_request_id)
+        raise
+    finally:
+        unregister_active_request(current_request_id, active_task)
 
 
 @app.post("/companies/research")

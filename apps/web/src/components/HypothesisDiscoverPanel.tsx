@@ -1,9 +1,9 @@
 "use client";
 
-import { Brain, Loader2, Search, Zap } from "lucide-react";
+import { Brain, Loader2, Search, Square, Zap } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { apiErrorMessage, publicApiUrl } from "../lib/api";
 import { OperationProgress, type OperationPhase } from "./OperationProgress";
 
@@ -22,6 +22,7 @@ type DiscoveryResult = {
   output?: Record<string, unknown>;
   created?: CreatedHypothesis[];
   skipped?: Record<string, unknown>[];
+  discovery_runs?: Record<string, unknown>[];
   collector_errors?: string[];
   context_summary?: Record<string, unknown>;
 };
@@ -30,6 +31,7 @@ const discoveryPhases: OperationPhase[] = [
   { at: 0, label: "入力準備", detail: "既存の仮説、企業情報、マクロ、文書を読み込んでいます。" },
   { at: 8, label: "データ取得", detail: "必要に応じてマクロ指数とニュースを追加取得しています。" },
   { at: 35, label: "仮説発見", detail: "根拠品質を確認しながら、未注目の可能性がある候補を探しています。" },
+  { at: 95, label: "追加収集", detail: "候補化に足りない場合だけ、Collectorで本文や関連データを補います。" },
   { at: 120, label: "候補保存", detail: "候補を仮説ボードへ保存し、LLMログを紐付けています。" }
 ];
 
@@ -48,8 +50,13 @@ function formatScore(value: unknown): string {
   return Number.isFinite(number) ? number.toFixed(1) : "-";
 }
 
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
 export function HypothesisDiscoverPanel() {
   const router = useRouter();
+  const requestController = useRef<AbortController | null>(null);
   const [focus, setFocus] = useState("");
   const [sector, setSector] = useState("");
   const [limit, setLimit] = useState("3");
@@ -57,16 +64,24 @@ export function HypothesisDiscoverPanel() {
   const [refresh, setRefresh] = useState(true);
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("auto");
   const [loading, setLoading] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [result, setResult] = useState<DiscoveryResult | null>(null);
 
   async function runDiscovery() {
+    if (loading) return;
+    const controller = new AbortController();
+    requestController.current = controller;
     setLoading(true);
+    setStopping(false);
     setError(null);
+    setNotice(null);
     try {
       const response = await fetch(`${publicApiUrl}/api/hypotheses/discover`, {
         method: "POST",
         headers: { "content-type": "application/json", accept: "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           focus: focus.trim() || undefined,
           sector: sector.trim() || undefined,
@@ -82,13 +97,26 @@ export function HypothesisDiscoverPanel() {
       setResult(payload);
       router.refresh();
     } catch (discoveryError) {
-      setError(discoveryError instanceof Error ? discoveryError.message : "仮説発見に失敗しました。");
+      if (isAbortError(discoveryError)) {
+        setNotice("仮説発見を停止しました。");
+      } else {
+        setError(discoveryError instanceof Error ? discoveryError.message : "仮説発見に失敗しました。");
+      }
     } finally {
       setLoading(false);
+      setStopping(false);
+      requestController.current = null;
     }
   }
 
+  function stopDiscovery() {
+    if (!requestController.current || !loading) return;
+    setStopping(true);
+    requestController.current.abort();
+  }
+
   const created = Array.isArray(result?.created) ? result.created : [];
+  const discoveryRuns = Array.isArray(result?.discovery_runs) ? result.discovery_runs : [];
   const output = asRecord(result?.output);
   const rawLog = asRecord(output.llm_raw);
 
@@ -137,11 +165,20 @@ export function HypothesisDiscoverPanel() {
           );
         })}
       </div>
-      <button className="primary-action" type="button" onClick={runDiscovery} disabled={loading}>
-        {loading ? <Loader2 className="spin" size={17} /> : <Search size={17} />}
-        <span>{loading ? "発見中" : "エージェントで仮説を発見"}</span>
-      </button>
+      <div className="run-actions">
+        <button className="primary-action" type="button" onClick={runDiscovery} disabled={loading}>
+          {loading ? <Loader2 className="spin" size={17} /> : <Search size={17} />}
+          <span>{loading ? "発見中" : "エージェントで仮説を発見"}</span>
+        </button>
+        {loading ? (
+          <button className="stop-action" type="button" onClick={stopDiscovery} disabled={stopping}>
+            {stopping ? <Loader2 className="spin" size={17} /> : <Square size={15} />}
+            <span>{stopping ? "停止中" : "停止"}</span>
+          </button>
+        ) : null}
+      </div>
       {loading ? <OperationProgress title="仮説発見実行中" phases={discoveryPhases} /> : null}
+      {notice ? <p className="form-notice">{notice}</p> : null}
       {error ? <p className="form-error">{error}</p> : null}
       {result ? (
         <div className="compact-result discovery-result">
@@ -162,6 +199,22 @@ export function HypothesisDiscoverPanel() {
           <small>
             next: {String(output.next_action ?? "-")} / {String(output.reason ?? "理由なし")}
           </small>
+          {discoveryRuns.length ? (
+            <div className="agent-log-list compact-agent-log">
+              {discoveryRuns.map((run, index) => (
+                <div className="agent-log-row" key={`${String(run.agent_name ?? "run")}-${index}`}>
+                  <strong>
+                    {index + 1}. {String(run.agent_name ?? "-")}
+                  </strong>
+                  <span>
+                    {String(run.next_action ?? "-")}
+                    {run.next_agent ? ` → ${String(run.next_agent)}` : ""}
+                  </span>
+                  <small>{String(run.reason ?? "")}</small>
+                </div>
+              ))}
+            </div>
+          ) : null}
           {Array.isArray(result.collector_errors) && result.collector_errors.length ? (
             <pre>{JSON.stringify(result.collector_errors, null, 2)}</pre>
           ) : null}

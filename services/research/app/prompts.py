@@ -10,7 +10,7 @@ COMPLIANCE = (
     "断定を避け、証拠の強さと不足情報を明示してください。"
     "低品質なランキング記事、まとめ記事、SEO記事、煽り見出しの記事は根拠として扱わず、弱い探索手掛かりに留めてください。"
     "一次情報、適時開示、決算資料、企業情報、公的統計、政策文書、信頼できる市場データで裏取りしてください。"
-    "検討内容は最終出力に混ぜず、根拠と不確実性をJSONフィールドに整理してください。"
+    "制御・UIに必要な情報は指定された構造化フィールドへ整理してください。"
 )
 
 SUMMARY_SYSTEM = (
@@ -32,20 +32,20 @@ AGENT_SYSTEMS = {
         + " あなたは仮説検証プロセスです。既存仮説を、ニュース、開示、財務、株価に照らして検証可能な主張へ分解します。"
         " 仮説タイプがglobalの場合は「この分野やセクターでは○○ではないか」という全体仮説として扱い、companyの場合は個別銘柄仮説として扱います。"
         " globalではcompanyやtickerがnullであることが正常です。対象銘柄がないことを理由に判断不能にせず、マクロ要因、セクター、企業特性、候補企業群の方向性へ分解してください。"
-        " 出力本文は自由文で構いませんが、最後に小さなCONTROL_JSONだけを付けてrouting_contextからnext_agentを自律的に選びます。finalizeは使わないでください。"
+        " 最初に小さなCONTROL_JSONを書き、続けて自由文で次工程への引き継ぎを書いてください。routing_contextからnext_agentを自律的に選びます。finalizeは使わないでください。"
     ),
     "skeptic": (
         COMPLIANCE
         + " あなたは検証・反証エージェントです。もっともらしい成長ストーリーを疑い、反証、織り込み済み、収益性、財務、競争、時間軸のリスクを検出します。"
         " global仮説では対象銘柄が未指定であること自体を反証にしないでください。セクター仮説、企業特性、候補企業群の選び方、マクロ伝播経路を反証してください。"
-        " 出力本文は自由文で構いませんが、最後に小さなCONTROL_JSONだけを付けてください。finalizeは使わないでください。"
+        " 最初に小さなCONTROL_JSONを書き、続けて自由文で次工程への引き継ぎを書いてください。finalizeは使わないでください。"
     ),
     "researcher": (
         COMPLIANCE
         + " あなたはリサーチエージェントです。追加調査、根拠統合、最終判断を担当します。データ不足ならnext_action=request_data、next_agent=collectorを指定します。finalizeできるのはあなたのみです。"
         " 十分な根拠と反証が揃っていない場合は、researcherに呼ばれたという理由だけでfinalizeせず、collector、skeptic、hypothesisのいずれかをnext_agentで指定してください。"
         " global仮説ではcompanyやtickerがnullでも正常です。対象銘柄がないことを理由にfinalizeしないでください。有望セクター、マクロ伝播経路、注目すべき企業特性、候補企業群、追加取得データを統合してください。"
-        " 出力本文は自由文で構いませんが、最後に小さなCONTROL_JSONだけを付けてください。最終化する場合はfinal_decisionとfinal_reportをCONTROL_JSONに含めます。"
+        " 最初に小さなCONTROL_JSONを書き、続けて自由文で次工程への引き継ぎを書いてください。最終化する場合はfinal_decisionとfinal_reportをCONTROL_JSONに含めます。"
     ),
 }
 
@@ -129,10 +129,20 @@ def discovery_user_prompt(payload: dict[str, Any]) -> str:
     {{"signal": "今回は仮説化しないが後で見る候補", "reason": "証拠不足・重複・粒度が粗い等"}}
   ],
   "next_action": "create_hypotheses | request_data | stop",
-  "reason": "判断理由"
+  "reason": "判断理由",
+  "data_requests": [
+    {{"query": "Collectorに取得してほしい具体的な対象", "source": "db | web | official | trusted_news | company_disclosure | market_data | document_body", "reason": "必要な理由", "priority": "high | medium | low"}}
+  ],
+  "missing_information": ["候補作成または次の検証で不足している情報"],
+  "recommended_next_research": ["作成後の仮説検証ループで確認する作業"]
 }}
 
 制約:
+- 仮説発見の目的は「保存して検証に回せるDraft仮説の作成」であり、最終検証・反証・投資判断ではない
+- 初期根拠と検証可能な成長ドライバーがある候補は、未確認事項が残っていてもhypothesesに入れ、next_action=create_hypothesesにする
+- next_action=request_dataは、現時点では保存すべき候補が1件もない場合、または本文・一次情報・企業候補が不足しすぎて候補化が危険な場合だけ使う
+- request_dataを使う場合はdata_requestsにCollectorが実行できる具体的な検索・DB取得・本文取得対象を書く
+- 「具体的な企業リストと財務データを取得し仮説を検証する必要がある」は、候補保存後のrecommended_next_researchに置く。これだけを理由にrequest_dataへしない
 - まずsignalsを整理し、その中から本当に検証可能なものだけをhypothesesへ昇格する
 - hypothesesの数は入力limit以下にする。類似テーマを細かく分割して数を増やさない
 - 昇格しない候補はbacklog_signalsへ入れ、仮説として保存させない
@@ -146,7 +156,9 @@ def discovery_user_prompt(payload: dict[str, Any]) -> str:
 - 個別仮説はtickerが入力companiesに存在する場合だけtickerを入れる。存在しない場合はglobal仮説にする
 - 根拠と反証が薄い候補は作らず、missing_informationとrecommended_next_researchへ回す
 - scoreは0〜10。score_overallは総合評価
-- 各候補のsummary、growth_driver、reason系テキストは短くする。長文レポートを書かず、JSONを閉じ切ることを最優先する
+- signalsは最大3件、hypothesesは最大3件、rejected_signals/backlog_signalsは各最大3件にする
+- 各候補のrequired_evidence、risk_factors、missing_information、recommended_next_research、source_quality_notesは各最大2件にする
+- 各文字列は原則120字以内、summaryだけ180字以内にする。長文レポートを書かず、JSONを閉じ切ることを最優先する
 - 最終出力はJSONのみ。前置き、Markdownコードフェンス、JSON以外の文章を出力しない
 """
 
@@ -154,7 +166,6 @@ def discovery_user_prompt(payload: dict[str, Any]) -> str:
 def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
     handoff_payload = {
         "loop_instruction": payload.get("loop_instruction"),
-        "llm_recovery_instruction": payload.get("llm_recovery_instruction"),
         "agent_handoff": payload.get("agent_handoff"),
         "routing_context": payload.get("routing_context"),
     }
@@ -164,7 +175,6 @@ def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
         if key
         not in {
             "loop_instruction",
-            "llm_recovery_instruction",
             "agent_handoff",
             "routing_context",
             "loop_history",
@@ -173,8 +183,9 @@ def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
     prompt_limit = int(payload.get("llm_prompt_budget_chars") or 11000)
     control_format = """
 出力形式:
-1. まず自由文で、次のAgentへ渡す分析・反証・不足情報を書いてください。ここはJSONでなくて構いません。
-2. 最後に必ず次の小さな制御ブロックだけを付けてください。API/UI/Collectorはこの部分だけを機械的に読みます。
+1. 最初に必ず次の小さな制御ブロックだけを書いてください。API/UI/Collectorはこの部分だけを機械的に読みます。
+2. その後に `HANDOFF_TEXT:` と書き、次のAgentへ渡す分析・反証・不足情報を自由文で書いてください。ここはJSONでなくて構いません。
+3. CONTROL_JSONは必ず出力の先頭1500文字以内で閉じてください。
 
 <CONTROL_JSON>
 {
@@ -199,6 +210,9 @@ def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
   "final_report": "researcherがfinalizeする場合のみ。400字以内"
 }
 </CONTROL_JSON>
+
+HANDOFF_TEXT:
+次工程への引き継ぎを1200字以内で記述。
 """
     return f"""
 エージェント: {agent_name}
@@ -213,12 +227,13 @@ def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
 
 制約:
 - 売買推奨や目標株価は出さない
+- 現在の入力に明示的な接続エラーがない限り、「LLM接続が利用できない」と書かない
 - 根拠と反証を分ける
 - 不足情報を明示する
 - まとめ記事、ランキング記事、SEO記事、煽り見出しは直接の根拠にせず、一次情報や信頼できる統計・開示で裏取りする
 - 表面的な「注目銘柄」記事から成長性を断定しない
 - routing_context.available_agentsを参照し、次に必要な工程をnext_agentで指定する
-- APIは原則としてあなたが指定したnext_agentを実行するため、同じ工程の繰り返しが必要か慎重に判断する
+- APIはnext_action/next_agentを推測補完しない。不正・欠落時はinvalid_controlとして停止するため、同じ工程の繰り返しが必要か慎重に判断する
 - 反証が不足している場合はskeptic、根拠統合が必要な場合はresearcher、仮説の再分解が必要な場合はhypothesisを指定する
 - データ不足で新たな取得が必要な場合はnext_actionをrequest_data、next_agentをcollectorにする
 - ニュースがタイトル/URLだけで本文根拠が不足している場合もcollectorに本文取得を要求する
@@ -228,7 +243,7 @@ def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
 - collector実行後は、取得結果に応じて反証、再仮説化、統合のどれが必要かを判断する
 - 入力にevidence_packがある場合は、選別済み証拠だけを主要根拠として扱い、低品質・重複で除外されたニュースを根拠にしない
 - 検証ループ中に新しい仮説を増殖させない。派生テーマが必要な場合はrecommended_next_researchまたはdata_requestsに留め、現在の仮説をrefine/narrow/rejectする
-- CONTROL_JSONは短くし、data_requestsは最大5件、missing_informationとrecommended_next_researchは最大6件に絞る
+- CONTROL_JSONは短くし、data_requestsは最大5件、missing_informationとrecommended_next_researchは最大6件に絞る。長い説明はHANDOFF_TEXTへ回す
 - 詳細分析、候補セクター、候補企業群、反証、判断理由は自由文側に書き、CONTROL_JSONへ長文を入れない
 - hypothesis_typeがglobalの場合、company=null/ticker=nullは正常であり、不足情報や失敗理由にしてはいけない
 - hypothesis_typeがglobalの場合、context.macro_indicators、context.sector_snapshots、context.recent_events、documents、companiesを使い、「有望セクター候補」「マクロ伝播経路」「根拠」「反証」「注目すべき企業特性」「候補企業群・代表例」「不足データ」を分ける
@@ -239,4 +254,5 @@ def agent_user_prompt(agent_name: str, payload: dict[str, Any]) -> str:
 - final_reportは「次に調べるべき」で終わらせず、まだ結論不能ならnext_action=request_dataまたはcall_agentを選ぶ
 - next_actionとnext_agentを必ず指定し、次に呼ぶべき工程を決める
 - CONTROL_JSONの中だけは厳密なJSONにする。CONTROL_JSONの外側は自由文でよい
+- HANDOFF_TEXTは1200字以内にし、足りない場合は「何を追加で調べるべきか」をdata_requestsへ移す
 """

@@ -1,7 +1,7 @@
 "use client";
 
-import { Brain, Loader2, Play, RefreshCw, Zap } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Brain, Loader2, Play, RefreshCw, Square, Zap } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { apiErrorMessage, publicApiUrl } from "../lib/api";
 import { OperationProgress, type OperationPhase } from "./OperationProgress";
 
@@ -86,6 +86,10 @@ function parseMaybeJson(value: string): unknown {
   } catch {
     return value;
   }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function resultOutput(result: Record<string, unknown> | null): Record<string, unknown> {
@@ -314,9 +318,12 @@ function LlmRawLogs({ result }: { result: Record<string, unknown> | null }) {
 }
 
 export function ResearchPanel(props: ResearchPanelProps) {
+  const requestController = useRef<AbortController | null>(null);
   const [loading, setLoading] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [result, setResult] = useState<Record<string, unknown> | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [thinkingMode, setThinkingMode] = useState<ThinkingMode>("auto");
   const [liveRuns, setLiveRuns] = useState<AgentRunLike[]>([]);
   const [liveBaselineId, setLiveBaselineId] = useState<number | null>(null);
@@ -348,7 +355,11 @@ export function ResearchPanel(props: ResearchPanelProps) {
   }, [loading, hypothesisId, liveBaselineId]);
 
   async function run() {
+    if (loading) return;
+    const controller = new AbortController();
+    requestController.current = controller;
     setError(null);
+    setNotice(null);
     setResult(null);
     setLiveRuns([]);
     setLiveError(null);
@@ -363,12 +374,14 @@ export function ResearchPanel(props: ResearchPanelProps) {
       setLiveBaselineId(null);
     }
     setLoading(true);
+    setStopping(false);
     try {
       const path =
         props.target === "company" ? `/api/companies/${props.ticker}/research` : `/api/hypotheses/${props.id}/run`;
       const response = await fetch(`${publicApiUrl}${path}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({ llm_thinking_mode: thinkingMode })
       });
       if (!response.ok) {
@@ -379,10 +392,25 @@ export function ResearchPanel(props: ResearchPanelProps) {
       }
       setResult((await response.json()) as Record<string, unknown>);
     } catch (runError) {
-      setError(runError instanceof Error ? runError.message : "research failed");
+      if (isAbortError(runError)) {
+        setNotice("実行を停止しました。");
+        if (props.target === "hypothesis") {
+          fetchHypothesisAgentRuns(props.id, liveBaselineId).then(setLiveRuns).catch(() => undefined);
+        }
+      } else {
+        setError(runError instanceof Error ? runError.message : "research failed");
+      }
     } finally {
       setLoading(false);
+      setStopping(false);
+      requestController.current = null;
     }
+  }
+
+  function stopRun() {
+    if (!requestController.current || !loading) return;
+    setStopping(true);
+    requestController.current.abort();
   }
 
   const report =
@@ -394,10 +422,18 @@ export function ResearchPanel(props: ResearchPanelProps) {
 
   return (
     <div className="research-panel">
-      <button className="primary-action" type="button" onClick={run} disabled={loading}>
-        {loading ? <Loader2 className="spin" size={17} /> : result ? <RefreshCw size={17} /> : <Play size={17} />}
-        <span>{props.label ?? "リサーチ実行"}</span>
-      </button>
+      <div className="run-actions">
+        <button className="primary-action" type="button" onClick={run} disabled={loading}>
+          {loading ? <Loader2 className="spin" size={17} /> : result ? <RefreshCw size={17} /> : <Play size={17} />}
+          <span>{props.label ?? "リサーチ実行"}</span>
+        </button>
+        {loading ? (
+          <button className="stop-action" type="button" onClick={stopRun} disabled={stopping}>
+            {stopping ? <Loader2 className="spin" size={17} /> : <Square size={15} />}
+            <span>{stopping ? "停止中" : "停止"}</span>
+          </button>
+        ) : null}
+      </div>
       <div className="mode-segment" aria-label="LLM thinking mode">
         {thinkingModes.map((mode) => {
           const Icon = mode.icon === "brain" ? Brain : Zap;
@@ -444,6 +480,7 @@ export function ResearchPanel(props: ResearchPanelProps) {
           <LlmRawLogs result={{ agent_runs: liveRuns }} />
         </div>
       ) : null}
+      {notice ? <p className="form-notice">{notice}</p> : null}
       {error ? <p className="error-copy">LLM実行に失敗しました: {error}</p> : null}
       <LoopTrace result={result} />
       <LlmRawLogs result={result} />

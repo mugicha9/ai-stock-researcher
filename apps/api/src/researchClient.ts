@@ -23,6 +23,7 @@ export class ResearchError extends Error {
 type ResearchPostOptions = {
   requestId?: string;
   route?: string;
+  signal?: AbortSignal;
 };
 
 type LongHttpResponse = {
@@ -81,14 +82,63 @@ function responseHeaderSummary(headers: IncomingHttpHeaders): JsonRecord {
   };
 }
 
+function notifyResearchCancel(requestId?: string, route?: string, researchPath?: string): void {
+  if (!requestId) return;
+  const url = new URL(`${config.researchApiUrl}/requests/${encodeURIComponent(requestId)}/cancel`);
+  const client = url.protocol === "https:" ? https : http;
+  const request = client.request(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "x-request-id": requestId,
+        "x-api-route": route ?? "",
+        accept: "application/json"
+      },
+      timeout: 5000
+    },
+    (response) => {
+      response.resume();
+      logger.warn(
+        {
+          request_id: requestId,
+          route,
+          research_path: researchPath,
+          cancel_status: response.statusCode
+        },
+        "research cancel notification sent"
+      );
+    }
+  );
+  request.on("timeout", () => request.destroy());
+  request.on("error", (error) => {
+    logger.warn({ request_id: requestId, route, research_path: researchPath, error: serializeError(error) }, "research cancel notification failed");
+  });
+  request.end();
+}
+
 function postJsonWithLongTimeout(
   urlString: string,
   body: string,
   headers: Record<string, string>,
   timeoutMs: number,
-  onHeaders: (response: Omit<LongHttpResponse, "text">) => void
+  onHeaders: (response: Omit<LongHttpResponse, "text">) => void,
+  signal?: AbortSignal,
+  onAbort?: () => void
 ): Promise<LongHttpResponse> {
   return new Promise((resolve, reject) => {
+    const abortError = () => {
+      if (signal?.reason instanceof Error) return signal.reason;
+      const error = new Error("Research request aborted by client");
+      error.name = "AbortError";
+      (error as Error & { code?: string }).code = "ABORT_ERR";
+      return error;
+    };
+    if (signal?.aborted) {
+      onAbort?.();
+      reject(abortError());
+      return;
+    }
     const url = new URL(urlString);
     const client = url.protocol === "https:" ? https : http;
     const request = client.request(
@@ -122,6 +172,16 @@ function postJsonWithLongTimeout(
       request.destroy(new ResearchTransportTimeoutError(timeoutMs));
     });
     request.on("error", reject);
+    let abortNotified = false;
+    const abortRequest = () => {
+      if (!abortNotified) {
+        abortNotified = true;
+        onAbort?.();
+      }
+      request.destroy(abortError());
+    };
+    signal?.addEventListener("abort", abortRequest, { once: true });
+    request.on("close", () => signal?.removeEventListener("abort", abortRequest));
     request.end(body);
   });
 }
@@ -176,7 +236,9 @@ export async function researchPost<T extends JsonRecord = JsonRecord>(
           },
           "research response headers received"
         );
-      }
+      },
+      options.signal,
+      () => notifyResearchCancel(options.requestId, options.route, path)
     );
 
     if (response.status < 200 || response.status >= 300) {
@@ -227,9 +289,10 @@ export async function researchPost<T extends JsonRecord = JsonRecord>(
     }
   } catch (error) {
     if (error instanceof ResearchError) throw error;
-    logger.error(
+    const aborted = options.signal?.aborted || (error instanceof Error && error.name === "AbortError");
+    logger[aborted ? "warn" : "error"](
       { request_id: options.requestId, route: options.route, research_path: path, duration_ms: Date.now() - startedAt, error: serializeError(error) },
-      "research request errored"
+      aborted ? "research request aborted" : "research request errored"
     );
     throw error;
   } finally {

@@ -32,8 +32,8 @@ class LlamaClient:
         self.request_retries = max(0, self._int_env("LLM_REQUEST_RETRIES", 2))
         self.retry_backoff_seconds = max(0.0, float(os.getenv("LLM_RETRY_BACKOFF_SECONDS", "2")))
         self.json_repair_retries = max(0, self._int_env("LLM_JSON_REPAIR_RETRIES", 1))
-        self.json_repair_max_tokens = max(250, min(self._int_env("LLM_JSON_REPAIR_MAX_TOKENS", 700), 1200))
-        self.json_repair_input_chars = max(2000, min(self._int_env("LLM_JSON_REPAIR_INPUT_CHARS", 6000), 12000))
+        self.json_repair_max_tokens = max(250, min(self._int_env("LLM_JSON_REPAIR_MAX_TOKENS", 1400), 2400))
+        self.json_repair_input_chars = max(2000, min(self._int_env("LLM_JSON_REPAIR_INPUT_CHARS", 12000), 24000))
         self.json_repair_fallback_chars = max(1000, min(self._int_env("LLM_JSON_REPAIR_FALLBACK_CHARS", 2500), 6000))
         self.response_format_json = os.getenv("LLM_RESPONSE_FORMAT_JSON", "true").lower() not in {"0", "false", "no", "off"}
         self.raw_log_enabled = os.getenv("LLM_RAW_LOG_ENABLED", "true").lower() != "false"
@@ -57,6 +57,15 @@ class LlamaClient:
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
         max_chars = max(1000, limit or self.raw_log_max_chars)
         return text if len(text) <= max_chars else f"{text[:max_chars]}\n...[truncated {len(text) - max_chars} chars]"
+
+    def _clip_middle(self, value: Any, limit: int | None = None) -> str:
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+        max_chars = max(1000, limit or self.raw_log_max_chars)
+        if len(text) <= max_chars:
+            return text
+        head = max_chars // 2
+        tail = max_chars - head
+        return f"{text[:head]}\n...[truncated middle {len(text) - max_chars} chars]\n{text[-tail:]}"
 
     def _raw_request(
         self,
@@ -483,6 +492,22 @@ class LlamaClient:
                                         default=str,
                                     ),
                                 )
+                                repaired = await self._repair_json_output(
+                                    base_url=base_url,
+                                    invalid_content=content,
+                                    fallback=fallback,
+                                    original_operation=operation,
+                                    request_id=request_id,
+                                    attempts=attempts,
+                                    max_tokens=max_tokens,
+                                    raw_request=raw_request,
+                                    original_status_code=response.status_code,
+                                    original_duration_ms=duration_ms,
+                                    original_data=data,
+                                    truncated=True,
+                                )
+                                if repaired is not None:
+                                    return repaired
                                 return self._fallback_with_raw_output(
                                     fallback,
                                     content,
@@ -851,20 +876,33 @@ class LlamaClient:
         original_status_code: int,
         original_duration_ms: int,
         original_data: dict[str, Any],
+        truncated: bool = False,
     ) -> dict[str, Any] | None:
         if self.json_repair_retries <= 0:
             return None
 
-        repair_system = (
-            "You are a JSON repair tool. Convert the invalid model output into one valid JSON object.\n"
-            "Return only JSON. Do not add Markdown, explanations, code fences, or comments.\n"
-            "Preserve the original meaning when possible. If fields are missing, use the fallback shape."
-        )
+        if truncated:
+            repair_system = (
+                "You are a JSON salvage tool. The source JSON was cut off by max_tokens.\n"
+                "Return exactly one valid JSON object and nothing else.\n"
+                "Do not continue the analysis. Do not add new facts, evidence_ids, companies, tickers, or hypotheses.\n"
+                "Preserve only complete recoverable content from the source. Drop incomplete trailing objects or fields.\n"
+                "Compress aggressively so the repaired JSON closes within the token budget.\n"
+                "For hypotheses.discover, keep at most 3 signals and at most 2 hypotheses; keep arrays to at most 2 items; keep string fields short.\n"
+                "If complete hypotheses are recoverable, set next_action to create_hypotheses. Otherwise set next_action to request_data and explain that the source was truncated."
+            )
+        else:
+            repair_system = (
+                "You are a JSON repair tool. Convert the invalid model output into one valid JSON object.\n"
+                "Return only JSON. Do not add Markdown, explanations, code fences, or comments.\n"
+                "Preserve the original meaning when possible. Do not invent facts; required schema fields may be set only from the source or to empty/null with an explicit reason."
+            )
         repair_user = (
-            "Fallback JSON shape:\n"
+            f"Operation: {original_operation}\n\n"
+            "Schema/reference JSON shape. Do not copy values that are not present in the invalid output:\n"
             f"{self._clip(fallback, self.json_repair_fallback_chars)}\n\n"
             "Invalid model output to repair:\n"
-            f"{self._clip(invalid_content, self.json_repair_input_chars)}\n\n"
+            f"{self._clip_middle(invalid_content, self.json_repair_input_chars)}\n\n"
             "Return exactly one valid JSON object now."
         )
         repair_max_tokens = max(250, min(max_tokens, self.json_repair_max_tokens))
@@ -1037,10 +1075,6 @@ class LlamaClient:
         if raw_interaction:
             output["llm_raw"] = raw_interaction
         output["llm_parse_failed"] = True
-        output["next_action"] = "call_agent"
-        output["next_agent"] = output.get("agent_name") if output.get("agent_name") in {"hypothesis", "skeptic", "researcher"} else "researcher"
-        output["should_continue"] = True
-        output["reason_for_next_action"] = "LLMは応答しましたがJSON整形に失敗したため、回収した生出力を暫定レポートとして返します。"
         output["reason"] = "LLM応答のJSON整形に失敗しました。生出力を確認してください。"
         if isinstance(output.get("final_report"), str):
             output["final_report"] = (
